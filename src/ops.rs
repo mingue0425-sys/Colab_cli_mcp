@@ -31,6 +31,7 @@ macro_rules! on_runtime {
                 }
                 other => {
                     $app.release(&$kernel).await;
+                    let _ = runtime::touch(&$app.home, &$lease.endpoint);
                     outcome = other;
                     break;
                 }
@@ -177,6 +178,8 @@ impl App {
                 Ok((result, kernel_id)) => {
                     let busy = result["status"] == "timeout";
                     runtime::remember_kernel(&self.home, slot, &lease.endpoint, &kernel_id, busy)?;
+                    runtime::touch(&self.home, &lease.endpoint)?;
+                    crate::reaper::ensure_running(&self.home);
                     self.release(&kernel).await;
                     return Ok((result, lease, allocated));
                 }
@@ -249,6 +252,66 @@ impl App {
         Ok(json!({"stopped": endpoints}))
     }
 
+    /// Stop managed runtimes idle for longer than the configured minutes:
+    /// no colab-cli use, no busy kernel, no kernel activity and no running job.
+    /// Returns the stopped endpoints and how many managed runtimes remain.
+    pub async fn reap_once(&self) -> Result<(Vec<String>, usize)> {
+        let minutes = runtime::idle_stop_minutes(&self.home) as i64;
+        if minutes == 0 {
+            return Ok((Vec::new(), 0));
+        }
+        let mut watching = 0;
+        let now = chrono::Utc::now().timestamp();
+        let managed = runtime::managed(&self.home);
+        let mut stopped = Vec::new();
+        for assignment in runtime::assignments(&self.api).await? {
+            let Some((_, endpoint, last_used)) = managed
+                .iter()
+                .find(|(_, endpoint, _)| assignment["endpoint"] == endpoint.as_str())
+            else {
+                continue; // Started elsewhere (for example in the browser): not ours to stop.
+            };
+            watching += 1;
+            if now - last_used < minutes * 60 {
+                continue;
+            }
+            let Some(lease) = runtime::lease_for(&assignment) else {
+                continue;
+            };
+            let kernel = Kernel::connect(&lease)?;
+            // If the runtime cannot be inspected, leave it running.
+            let Ok((busy, activity)) = kernel.activity().await else {
+                continue;
+            };
+            if busy || activity.is_some_and(|t| now - t < minutes * 60) {
+                continue;
+            }
+            let running_job = match kernel.list(jobs::ROOT).await {
+                Ok(listing) => {
+                    let mut running = false;
+                    for entry in listing["entries"].as_array().into_iter().flatten() {
+                        let id = entry["name"].as_str().unwrap_or_default();
+                        if matches!(kernel.tail(&format!("{}/exit_code", jobs::dir(id)), 16).await, Err(ref e) if e.code == "not_found")
+                        {
+                            running = true;
+                            break;
+                        }
+                    }
+                    running
+                }
+                Err(error) if error.code == "not_found" => false,
+                Err(_) => continue,
+            };
+            if running_job {
+                continue;
+            }
+            runtime::stop(&self.api, &self.home, endpoint).await?;
+            stopped.push(endpoint.clone());
+            watching -= 1;
+        }
+        Ok((stopped, watching))
+    }
+
     /// Interrupt the running cell, or restart the kernel (clears variables).
     pub async fn signal(
         &self,
@@ -309,6 +372,90 @@ impl App {
         on_runtime!(self, slot, endpoint, |kernel, _lease| kernel
             .upload(local, remote)
             .await)
+    }
+
+    /// Copy a runtime file straight into Drive (no Drive mount or approval needed).
+    pub async fn save_to_drive(
+        &self,
+        remote: &str,
+        folder: Option<&str>,
+        parent: Option<&str>,
+        name: Option<&str>,
+        slot: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Result<Value> {
+        let parts = kernel::remote_parts(remote)?;
+        let name = name
+            .map(str::to_owned)
+            .unwrap_or_else(|| parts.last().cloned().unwrap_or_default());
+        let parent = drive::destination(&self.api, parent, folder).await?;
+        on_runtime!(self, slot, endpoint, |kernel, _lease| {
+            let response = kernel.open_file(remote).await?;
+            let size = response.content_length().ok_or_else(|| {
+                Error::new(
+                    "unsupported_file",
+                    "The runtime did not report the file size.",
+                    "Download it with `colab download`, then `colab drive upload`.",
+                )
+            })?;
+            let mime = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(';').next())
+                // The runtime guesses types from extensions (".pt" becomes a
+                // game-console format); pass only common ones, else Drive decides.
+                .filter(|v| {
+                    ["text/", "image/", "audio/", "video/"]
+                        .iter()
+                        .any(|p| v.starts_with(p))
+                        || [
+                            "application/json",
+                            "application/pdf",
+                            "application/zip",
+                            "application/gzip",
+                        ]
+                        .contains(v)
+                })
+                .map(str::to_owned);
+            let body = reqwest::Body::wrap_stream(response.bytes_stream());
+            let mut uploaded = drive::upload_body(
+                &self.api,
+                &name,
+                parent.as_deref(),
+                mime.as_deref(),
+                size,
+                body,
+            )
+            .await?;
+            uploaded["source"] = remote.into();
+            Ok(uploaded)
+        })
+    }
+
+    /// Wait until a job finishes (or the wait ends) and return its status.
+    pub async fn job_wait(
+        &self,
+        id: &str,
+        seconds: u64,
+        lines: usize,
+        slot: Option<&str>,
+        endpoint: Option<&str>,
+    ) -> Result<Value> {
+        let deadline = std::time::Instant::now() + timeout(seconds)?;
+        loop {
+            let status = self.job_status(id, lines, slot, endpoint).await?;
+            if status["state"] != "running" {
+                return Ok(status);
+            }
+            if std::time::Instant::now() + Duration::from_secs(5) > deadline {
+                let mut status = status;
+                status["note"] =
+                    "Still running after the wait; call job wait or job status again.".into();
+                return Ok(status);
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     }
 
     /// CLI downloads land in the working directory unless COLAB_CLI_DOWNLOADS is set.

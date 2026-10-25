@@ -10,6 +10,7 @@ mod jobs;
 mod kernel;
 mod mcp;
 mod ops;
+mod reaper;
 mod runtime;
 
 use clap::{Args, Parser, Subcommand};
@@ -152,8 +153,28 @@ enum Command {
     /// Colab notebooks in Google Drive.
     #[command(subcommand)]
     Notebook(NotebookCommand),
+    /// Copy a runtime file straight into Google Drive (no Drive mount or approval).
+    SaveToDrive {
+        remote: String,
+        /// Destination folder path under My Drive, created if missing.
+        #[arg(long, conflicts_with = "parent")]
+        folder: Option<String>,
+        /// Destination folder ID.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Name in Drive (default: the file's name).
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Show or set the idle minutes after which colab-cli stops its runtimes (0 disables).
+    IdleStop { minutes: Option<u64> },
     /// Serve these features as MCP tools over stdio.
     Mcp,
+    /// Internal: the idle auto-stop watcher.
+    #[command(hide = true)]
+    Reaper,
 }
 
 #[derive(Subcommand)]
@@ -189,6 +210,16 @@ enum JobCommand {
     /// Stop a job and all its child processes.
     Stop {
         job: String,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Wait until a job finishes (or --timeout seconds pass), then print its status.
+    Wait {
+        job: String,
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
         #[command(flatten)]
         target: Target,
     },
@@ -237,10 +268,15 @@ enum DriveCommand {
         local: PathBuf,
         #[arg(long)]
         name: Option<String>,
-        /// Destination folder ID (default: My Drive).
+        /// Destination folder path under My Drive, created if missing (e.g. results/run-1).
+        #[arg(long, conflicts_with = "parent")]
+        folder: Option<String>,
+        /// Destination folder ID.
         #[arg(long)]
         parent: Option<String>,
     },
+    /// Find or create a folder path under My Drive and print its ID.
+    Mkdir { path: String },
 }
 
 #[derive(Subcommand)]
@@ -306,10 +342,52 @@ async fn dispatch(command: Command) -> Result<Value> {
         mcp::serve(App::new(true)?).await?;
         return Ok(Value::Null);
     }
+    if let Command::Reaper = command {
+        reaper::run(App::new(false)?).await?;
+        return Ok(Value::Null);
+    }
     let app = App::new(false)?;
     let api = &app.api;
     Ok(match command {
-        Command::Mcp => unreachable!(),
+        Command::Mcp | Command::Reaper => unreachable!(),
+        Command::IdleStop { minutes } => {
+            if let Some(minutes) = minutes {
+                runtime::set_idle_stop_minutes(&app.home, minutes)?;
+            }
+            serde_json::json!({"idle_stop_minutes": runtime::idle_stop_minutes(&app.home)})
+        }
+        Command::SaveToDrive {
+            remote,
+            folder,
+            parent,
+            name,
+            target,
+        } => {
+            app.save_to_drive(
+                &remote,
+                folder.as_deref(),
+                parent.as_deref(),
+                name.as_deref(),
+                target.slot.as_deref(),
+                target.endpoint.as_deref(),
+            )
+            .await?
+        }
+        Command::Job(JobCommand::Wait {
+            job,
+            timeout,
+            lines,
+            target,
+        }) => {
+            app.job_wait(
+                &job,
+                timeout,
+                lines,
+                target.slot.as_deref(),
+                target.endpoint.as_deref(),
+            )
+            .await?
+        }
         Command::Auth(AuthCommand::Login { client, no_browser }) => {
             api.auth.login(client.as_deref(), !no_browser).await?
         }
@@ -440,7 +518,12 @@ async fn dispatch(command: Command) -> Result<Value> {
             local,
             name,
             parent,
-        }) => drive::upload(api, &local, name.as_deref(), parent.as_deref(), None).await?,
+            folder,
+        }) => {
+            let parent = drive::destination(api, parent.as_deref(), folder.as_deref()).await?;
+            drive::upload(api, &local, name.as_deref(), parent.as_deref(), None).await?
+        }
+        Command::Drive(DriveCommand::Mkdir { path }) => drive::ensure_folder(api, &path).await?,
         Command::Notebook(NotebookCommand::List { name, limit, page }) => {
             drive::notebooks(api, name.as_deref(), limit, page.as_deref()).await?
         }

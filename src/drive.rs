@@ -122,7 +122,71 @@ pub async fn download(api_: &Api, id: &str, out: Option<&Path>, force: bool) -> 
     )
 }
 
-/// Resumable upload: metadata first, then the file streamed in one request.
+pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
+
+/// Find or create a folder path such as `results/run-1` under My Drive.
+pub async fn ensure_folder(api_: &Api, path: &str) -> Result<Value> {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() || parts.len() > 20 || parts.iter().any(|p| p.len() > 255) {
+        return Err(Error::input(
+            "Folder paths look like results or results/run-1.",
+        ));
+    }
+    let mut parent = "root".to_owned();
+    let mut created = false;
+    for name in parts {
+        let query = format!(
+            "name = {} and mimeType = {} and {} in parents and trashed = false",
+            quote(name),
+            quote(FOLDER_MIME),
+            quote(&parent)
+        );
+        let found = search(api_, &query, 1, None).await?;
+        parent = match found["files"][0]["id"].as_str() {
+            Some(id) => id.to_owned(),
+            None => {
+                created = true;
+                let folder = api_
+                    .json("Folder create", |http, token| {
+                        http.post(api("drive/v3/files"))
+                            .bearer_auth(token)
+                            .query(&[("fields", "id")])
+                            .json(&json!({"name": name, "mimeType": FOLDER_MIME, "parents": [parent]}))
+                    })
+                    .await?;
+                folder["id"]
+                    .as_str()
+                    .ok_or_else(|| Error::network("Folder create"))?
+                    .to_owned()
+            }
+        };
+    }
+    Ok(json!({"id": parent, "path": path, "created": created}))
+}
+
+/// Destination folder ID from an explicit ID or a folder path (created if missing).
+pub async fn destination(
+    api_: &Api,
+    parent: Option<&str>,
+    folder: Option<&str>,
+) -> Result<Option<String>> {
+    match (parent, folder) {
+        (Some(_), Some(_)) => Err(Error::input("Give a folder path or a parent ID, not both.")),
+        (Some(parent), None) => {
+            check_id(parent)?;
+            Ok(Some(parent.to_owned()))
+        }
+        (None, Some(folder)) => Ok(Some(
+            ensure_folder(api_, folder).await?["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Upload a local file (resumable, streamed).
 pub async fn upload(
     api_: &Api,
     local: &Path,
@@ -130,16 +194,35 @@ pub async fn upload(
     parent: Option<&str>,
     mime: Option<&str>,
 ) -> Result<Value> {
-    if let Some(parent) = parent {
-        check_id(parent)?;
-    }
     let size = tokio::fs::metadata(local).await?.len();
     let name = name
         .map(str::to_owned)
         .or_else(|| local.file_name().map(|n| n.to_string_lossy().to_string()))
         .ok_or_else(|| Error::input("Give the upload a --name."))?;
+    let file = tokio::fs::File::open(local).await?;
+    upload_body(
+        api_,
+        &name,
+        parent,
+        mime,
+        size,
+        reqwest::Body::wrap_stream(tokio_util_stream(file)),
+    )
+    .await
+}
+
+/// Resumable upload: metadata first, then the body streamed in one request.
+pub async fn upload_body(
+    api_: &Api,
+    name: &str,
+    parent: Option<&str>,
+    mime: Option<&str>,
+    size: u64,
+    body: reqwest::Body,
+) -> Result<Value> {
     let mut metadata = json!({"name": name});
     if let Some(parent) = parent {
+        check_id(parent)?;
         metadata["parents"] = json!([parent]);
     }
     // Notebooks open in Colab only with Colab's MIME type.
@@ -153,7 +236,7 @@ pub async fn upload(
                 .bearer_auth(token)
                 .query(&[
                     ("uploadType", "resumable"),
-                    ("fields", "id,name,mimeType,size,webViewLink"),
+                    ("fields", "id,name,mimeType,size,parents,webViewLink"),
                 ])
                 .header("x-upload-content-length", size.to_string())
                 .json(&metadata)
@@ -169,8 +252,6 @@ pub async fn upload(
         .filter(|l| l.starts_with(&config::google_api_url()))
         .ok_or_else(|| Error::network("Drive upload"))?
         .to_owned();
-    let file = tokio::fs::File::open(local).await?;
-    let body = reqwest::Body::wrap_stream(tokio_util_stream(file));
     let token = api_.auth.access_token().await?;
     let response = api_
         .http

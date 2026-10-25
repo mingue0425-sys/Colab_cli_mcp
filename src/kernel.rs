@@ -438,6 +438,29 @@ impl Kernel {
         self.session().await
     }
 
+    /// Whether any kernel is busy, and the latest kernel activity (unix seconds).
+    pub async fn activity(&self) -> Result<(bool, Option<i64>)> {
+        let kernels = self
+            .json(
+                reqwest::Method::GET,
+                self.url("api/kernels")?,
+                None,
+                "Kernel list",
+            )
+            .await?;
+        let mut busy = false;
+        let mut latest = None;
+        for kernel in kernels.as_array().into_iter().flatten() {
+            busy |= kernel["execution_state"] == "busy";
+            let when = kernel["last_activity"]
+                .as_str()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp());
+            latest = latest.max(when);
+        }
+        Ok((busy, latest))
+    }
+
     /// `idle`, `busy` or `starting`.
     pub async fn state(&self, kernel_id: &str) -> Result<String> {
         let kernel = self
@@ -553,7 +576,8 @@ impl Kernel {
     }
 
     /// Stream a runtime file to a local path (no size limit, no buffering).
-    pub async fn download(&self, path: &str, out: &Path, force: bool) -> Result<Value> {
+    /// A runtime file as a streaming response.
+    pub async fn open_file(&self, path: &str) -> Result<reqwest::Response> {
         let url = self.file_url("files/", &remote_parts(path)?)?;
         let response = self
             .http
@@ -563,16 +587,18 @@ impl Kernel {
             .await
             .map_err(|_| unavailable("Runtime download"))?;
         match response.status().as_u16() {
-            200 => {}
-            404 => {
-                return Err(Error::new(
-                    "not_found",
-                    format!("{path} does not exist on the runtime."),
-                    "Check the path with `colab ls`.",
-                ));
-            }
-            _ => return Err(unavailable("Runtime download")),
+            200 => Ok(response),
+            404 => Err(Error::new(
+                "not_found",
+                format!("{path} does not exist on the runtime."),
+                "Check the path with `colab ls`.",
+            )),
+            _ => Err(unavailable("Runtime download")),
         }
+    }
+
+    pub async fn download(&self, path: &str, out: &Path, force: bool) -> Result<Value> {
+        let response = self.open_file(path).await?;
         let media_type = response
             .headers()
             .get("content-type")

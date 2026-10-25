@@ -123,6 +123,63 @@ struct SlotRecord {
     /// When Colab last listed this runtime.
     #[serde(default)]
     confirmed_at: i64,
+    /// When colab-cli last used this runtime; drives the idle auto-stop.
+    #[serde(default)]
+    last_used: i64,
+}
+
+/// Minutes without use after which colab-cli stops a runtime it manages
+/// (0 disables). `COLAB_CLI_IDLE_STOP` overrides the saved setting.
+pub fn idle_stop_minutes(home: &Path) -> u64 {
+    if let Some(minutes) = std::env::var("COLAB_CLI_IDLE_STOP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return minutes;
+    }
+    std::fs::read(home.join("config.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|config| config["idle_stop_minutes"].as_u64())
+        .unwrap_or(30)
+}
+
+pub fn set_idle_stop_minutes(home: &Path, minutes: u64) -> Result<()> {
+    config::write_private(
+        &home.join("config.json"),
+        &serde_json::to_vec_pretty(&json!({"idle_stop_minutes": minutes}))?,
+    )
+}
+
+/// Mark a runtime as just used.
+pub fn touch(home: &Path, endpoint: &str) -> Result<()> {
+    let mut slots = load_slots(home);
+    let mut changed = false;
+    for record in slots
+        .values_mut()
+        .filter(|r| r.endpoint == endpoint && r.last_used < now() - 10)
+    {
+        record.last_used = now();
+        changed = true;
+    }
+    if changed {
+        save_slots(home, &slots)?;
+    }
+    Ok(())
+}
+
+/// Runtimes colab-cli manages, as (slot, endpoint, last used).
+pub fn managed(home: &Path) -> Vec<(String, String, i64)> {
+    load_slots(home)
+        .into_iter()
+        .filter(|(_, r)| !r.endpoint.is_empty())
+        .map(|(slot, r)| (slot, r.endpoint, r.last_used))
+        .collect()
+}
+
+/// A lease for a listed assignment, for maintenance work such as the idle check.
+pub fn lease_for(assignment: &Value) -> Option<Lease> {
+    lease_from(assignment)
 }
 
 fn now() -> i64 {
@@ -293,6 +350,7 @@ pub async fn usage(api: &Api) -> Result<Value> {
 /// Runtimes without their private proxy tokens, labelled with known slots.
 pub async fn status(api: &Api, home: &Path) -> Result<Value> {
     let slots = load_slots(home);
+    let idle_stop = idle_stop_minutes(home) as i64;
     let runtimes: Vec<Value> = assignments(api)
         .await?
         .iter()
@@ -304,10 +362,18 @@ pub async fn status(api: &Api, home: &Path) -> Result<Value> {
                 "accelerator": a["accelerator"],
                 "variant": match a["variant"].as_i64() { Some(1) => "GPU", Some(2) => "TPU", _ => "DEFAULT" },
                 "high_ram": a["machineShape"].as_i64() == Some(1),
+                "idle_minutes": slots.values().find(|r| r.endpoint == endpoint && r.last_used > 0).map(|r| (now() - r.last_used) / 60),
             })
         })
         .collect();
-    Ok(json!({"runtimes": runtimes}))
+    Ok(json!({
+        "runtimes": runtimes,
+        "auto_stop": if idle_stop > 0 {
+            json!(format!("Runtimes started by colab-cli stop after {idle_stop} idle minutes (no runs, no busy kernel, no running job). Change with `colab idle-stop MINUTES`; 0 disables."))
+        } else {
+            json!("Disabled; stop runtimes with `colab stop`.")
+        },
+    }))
 }
 
 /// Find or allocate the slot's runtime. Without explicit hardware, the slot's
@@ -416,6 +482,7 @@ pub async fn lease(
             },
             busy: same_runtime && previous.busy,
             confirmed_at: now(),
+            last_used: now(),
         },
     );
     save_slots(home, &slots)?;

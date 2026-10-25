@@ -26,12 +26,15 @@ State lives in `$COLAB_CLI_HOME` (default `~/.colab-cli`): `token.json` (owner-o
 | `colab run [CODE \| -f FILE \| stdin]` | Run code like a notebook cell. `--gpu T4`, `--tpu V5E1`, `--cpu`, `--high-ram`, `--slot NAME`, `--timeout SECS` |
 | `colab interrupt` / `colab restart` | Stop the running cell (variables kept) / restart the kernel (variables cleared) |
 | `colab job start [CODE \| -f FILE \| stdin] [--shell] [--name N]` | Run long work as a background process; returns a job ID at once |
+| `colab job wait JOB [--timeout S]` | Block until the job ends, then print its status |
 | `colab job status JOB [--lines N]` / `job list` / `job stop JOB` | State (`running`, `succeeded`, `failed`, `stopped`), exit code and the end of the log |
 | `colab stop [--slot S \| --endpoint E \| --all]` | Stop runtimes |
 | `colab ls [PATH]` | List files on the runtime (default `content`) |
 | `colab download REMOTE [--out PATH] [--force]` | Stream a runtime file to disk |
 | `colab upload LOCAL [REMOTE]` | Upload a file to the runtime (chunked; default `content/<name>`) |
-| `colab drive search QUERY` / `download ID` / `upload LOCAL` | Drive files (resumable upload, original names kept) |
+| `colab save-to-drive REMOTE [--folder PATH]` | Copy a runtime file straight into Drive (no mount, no approval; folders are created) |
+| `colab drive search QUERY` / `download ID` / `upload LOCAL [--folder PATH]` / `mkdir PATH` | Drive files (resumable upload, original names kept) |
+| `colab idle-stop [MINUTES]` | Show or set the idle auto-stop (default 30, 0 disables) |
 | `colab notebook list` / `read ID` / `create NAME` / `copy ID NAME` / `rename ID NAME` | Colab notebooks |
 | `colab notebook run ID [--save] [--continue-on-error]` | Run a notebook's code cells; `--save` writes the outputs back |
 | `colab auth login` / `import` / `status` / `logout` | Google sign-in |
@@ -52,6 +55,10 @@ After a timeout the code keeps running and the kernel stays busy. The next run i
 ### Background jobs
 
 `colab job start -f train.py --gpu T4` starts the script as a detached process. It logs to `content/.colab-cli/jobs/JOB/log` and records the exit code when it ends. `job status` and `job list` read these files directly, so they work even while the kernel is busy. `job stop` ends the job's whole process group. Jobs survive `colab restart`, but not `colab stop`.
+
+### Idle auto-stop
+
+When colab-cli starts or uses a runtime, it also starts a small background watcher (`colab reaper`, one per data directory). Once a minute it stops runtimes colab-cli manages that have been idle for the configured minutes. Idle means no colab-cli use, no busy or recently active kernel, and no running background job. Runtimes started elsewhere, such as in the browser, are never touched. The watcher exits when nothing is left to watch, and logs what it stopped to `reaper.log`. Colab also reclaims idle runtimes itself, but later, so idle GPU time can use quota until then.
 
 ### Speed
 

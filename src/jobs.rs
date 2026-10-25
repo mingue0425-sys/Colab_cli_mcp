@@ -126,6 +126,7 @@ pub fn parse_line(result: &Value) -> Result<Value> {
 }
 
 /// Last `lines` lines of a log tail, starting at a line boundary when cut.
+/// Progress bars redraw a line with carriage returns; only the last state counts.
 pub fn last_lines(bytes: &[u8], lines: usize, cut: bool) -> String {
     let text = String::from_utf8_lossy(bytes);
     let text = if cut {
@@ -133,7 +134,16 @@ pub fn last_lines(bytes: &[u8], lines: usize, cut: bool) -> String {
     } else {
         &text
     };
-    let all: Vec<&str> = text.lines().collect();
+    let all: Vec<&str> = text
+        .lines()
+        .map(|line| {
+            line.trim_end_matches('\r')
+                .rsplit('\r')
+                .next()
+                .unwrap_or("")
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
@@ -169,6 +179,10 @@ mod tests {
     fn log_tails_start_on_a_line() {
         assert_eq!(last_lines(b"partial\nb\nc\nd\n", 2, true), "c\nd");
         assert_eq!(last_lines(b"a\nb\n", 5, false), "a\nb");
+        assert_eq!(
+            last_lines(b"get 10%\rget 50%\rget 100%\nepoch 1\n", 5, false),
+            "get 100%\nepoch 1"
+        );
         let parsed =
             parse_line(&json!({"status": "ok", "text": "noise\n{\"job\": \"j\", \"pid\": 3}\n"}))
                 .unwrap();
