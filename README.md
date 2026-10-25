@@ -24,6 +24,9 @@ State lives in `$COLAB_CLI_HOME` (default `~/.colab-cli`): `token.json` (owner-o
 | `colab usage` | Compute units and eligible GPUs/TPUs |
 | `colab status` | Running runtimes (endpoint, slot, accelerator) |
 | `colab run [CODE \| -f FILE \| stdin]` | Run code like a notebook cell. `--gpu T4`, `--tpu V5E1`, `--cpu`, `--high-ram`, `--slot NAME`, `--timeout SECS` |
+| `colab interrupt` / `colab restart` | Stop the running cell (variables kept) / restart the kernel (variables cleared) |
+| `colab job start [CODE \| -f FILE \| stdin] [--shell] [--name N]` | Run long work as a background process; returns a job ID at once |
+| `colab job status JOB [--lines N]` / `job list` / `job stop JOB` | State (`running`, `succeeded`, `failed`, `stopped`), exit code and the end of the log |
 | `colab stop [--slot S \| --endpoint E \| --all]` | Stop runtimes |
 | `colab ls [PATH]` | List files on the runtime (default `content`) |
 | `colab download REMOTE [--out PATH] [--force]` | Stream a runtime file to disk |
@@ -42,7 +45,19 @@ A slot (default `default`) names one runtime. Runs in the same slot share Python
 
 ### Results for agents
 
-`run` returns `status` (`ok`, `error`, `timeout`), `text`, nbformat `outputs` and `runtime`. Long streams keep their first 4 KiB and newest 60 KiB. Images and rich outputs over 32 KiB become `[omitted: N bytes]`, with a `note` to save and download them instead. After a timeout the code keeps running; start long jobs as background processes and poll their logs.
+`run` returns `status` (`ok`, `error`, `timeout`), `text`, `outputs` and `runtime`. `text` holds everything printed, results and tracebacks. Long streams keep their first 4 KiB and newest 60 KiB. `outputs` adds only what `text` lacks: rich data such as HTML tables, and error names. Images and rich outputs over 32 KiB become `[omitted: N bytes]`, with a `note` to save and download them instead. `--full-outputs` keeps stdout and tracebacks in `outputs` too; `notebook run` always keeps complete outputs.
+
+After a timeout the code keeps running and the kernel stays busy. The next run in that slot returns `kernel_busy` at once instead of queuing; use `colab interrupt` to stop it.
+
+### Background jobs
+
+`colab job start -f train.py --gpu T4` starts the script as a detached process. It logs to `content/.colab-cli/jobs/JOB/log` and records the exit code when it ends. `job status` and `job list` read these files directly, so they work even while the kernel is busy. `job stop` ends the job's whole process group. Jobs survive `colab restart`, but not `colab stop`.
+
+### Speed
+
+A slot caches its runtime address, proxy token (owner-only file) and kernel, so a run on a warm runtime skips the Colab lookup and the session lookup. A cached runtime not confirmed in the last 60 seconds is checked with Colab in parallel with the kernel connection. This matters because a runtime stopped elsewhere keeps answering for a while, and code is never sent to one Colab no longer lists. If a cached runtime stops answering before code is sent, colab-cli looks it up again or starts a fresh one. `colab mcp` also keeps the kernel connection open between calls.
+
+Measured on a warm CPU runtime (Korea to a US runtime): a CLI `run` takes about 0.5–1 s, down from 1.7–2.4 s, and a repeated MCP `colab_run` takes about 0.2 s. `COLAB_CLI_TRACE=1` prints phase timings to stderr.
 
 ### Google Drive on the runtime
 

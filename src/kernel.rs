@@ -15,7 +15,10 @@ use async_tungstenite::{
 use base64::Engine;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 use tokio::io::AsyncWriteExt;
 
 const TOKEN_HEADER: &str = "x-colab-runtime-proxy-token";
@@ -26,6 +29,9 @@ const STREAM_HEAD: usize = 4 * 1024;
 const STREAM_TAIL: usize = 60 * 1024;
 const RICH_LIMIT: usize = 32 * 1024;
 const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
+/// A long-lived process (the MCP server) reuses an idle kernel channel only
+/// briefly, so a proxy-closed connection is not mistaken for a live one.
+const CHANNEL_REUSE: Duration = Duration::from_secs(20);
 
 type Socket = WebSocketStream<TokioAdapter<reqwest::Upgraded>>;
 
@@ -41,6 +47,22 @@ pub struct Kernel {
     http: reqwest::Client,
     base: url::Url,
     token: String,
+    open: tokio::sync::Mutex<Option<Channel>>,
+}
+
+struct Channel {
+    socket: Socket,
+    session: String,
+    kernel_id: String,
+    last_used: Instant,
+}
+
+fn kernel_gone() -> Error {
+    Error::new(
+        "kernel_gone",
+        "The kernel no longer exists on this runtime.",
+        "Run again; a new kernel is started automatically.",
+    )
 }
 
 /// Remote paths are relative to the runtime's filesystem root.
@@ -90,6 +112,7 @@ impl Kernel {
             http,
             base,
             token: lease.token.clone(),
+            open: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -197,6 +220,9 @@ impl Kernel {
             .send()
             .await
             .map_err(|_| unavailable("Kernel connection"))?;
+        if response.status().as_u16() == 404 {
+            return Err(kernel_gone());
+        }
         let accepted = response
             .headers()
             .get("sec-websocket-accept")
@@ -222,8 +248,50 @@ impl Kernel {
         ))
     }
 
-    /// Run one cell. Drive-mount credential requests are answered through the
-    /// Colab backend with the user's Google sign-in, never inside the kernel.
+    /// Reuse a recent open channel, else the slot's known kernel, else look
+    /// the kernel session up (starting one if needed).
+    async fn channel_to(&self, known: Option<&str>) -> Result<Channel> {
+        if let Some(open) = self.open.lock().await.take().filter(|c| {
+            c.last_used.elapsed() < CHANNEL_REUSE && known.is_none_or(|id| id == c.kernel_id)
+        }) {
+            return Ok(open);
+        }
+        if let Some(id) = known {
+            match self.channel(id).await {
+                Ok((socket, session)) => {
+                    return Ok(Channel {
+                        socket,
+                        session,
+                        kernel_id: id.to_owned(),
+                        last_used: Instant::now(),
+                    });
+                }
+                Err(error) if error.code == "kernel_gone" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let started = Instant::now();
+        let id = self.session().await?;
+        config::trace("session", started);
+        let (socket, session) = self.channel(&id).await?;
+        Ok(Channel {
+            socket,
+            session,
+            kernel_id: id,
+            last_used: Instant::now(),
+        })
+    }
+
+    /// Open the kernel channel ahead of a run, so it can overlap other work.
+    pub async fn prepare(&self, known: Option<&str>) -> Result<()> {
+        let channel = self.channel_to(known).await?;
+        *self.open.lock().await = Some(channel);
+        Ok(())
+    }
+
+    /// Run one cell and return the result and the kernel that ran it.
+    /// Drive-mount credential requests are answered through the Colab backend
+    /// with the user's Google sign-in, never inside the kernel.
     /// `full` keeps every output unshortened, for writing results into a notebook.
     pub async fn execute(
         &self,
@@ -232,28 +300,49 @@ impl Kernel {
         code: &str,
         timeout: Duration,
         full: bool,
-    ) -> Result<Value> {
-        let kernel_id = self.session().await?;
-        let (mut socket, session) = self.channel(&kernel_id).await?;
-        let message = |channel: &str, kind: &str, parent: Value, content: Value| {
+    ) -> Result<(Value, String)> {
+        let started = Instant::now();
+        let mut channel = self.channel_to(lease.kernel_id.as_deref()).await?;
+        config::trace("channel", started);
+        let request = |session: &str| {
             let msg_id = uuid::Uuid::new_v4().to_string();
-            let message = json!({
-                "header": {"msg_id": msg_id, "msg_type": kind, "session": session, "username": "colab-cli",
+            let request = json!({
+                "header": {"msg_id": msg_id, "msg_type": "execute_request", "session": session, "username": "colab-cli",
                            "version": "5.3", "date": chrono::Utc::now().to_rfc3339()},
-                "parent_header": parent, "metadata": {}, "buffers": [], "channel": channel, "content": content,
+                "parent_header": {}, "metadata": {}, "buffers": [], "channel": "shell",
+                "content": {"code": code, "silent": false, "store_history": true, "user_expressions": {}, "allow_stdin": true, "stop_on_error": true},
             });
-            (msg_id, message)
+            (msg_id, request)
         };
-        let (msg_id, request) = message(
-            "shell",
-            "execute_request",
-            json!({}),
-            json!({"code": code, "silent": false, "store_history": true, "user_expressions": {}, "allow_stdin": true, "stop_on_error": true}),
-        );
-        socket
-            .send(Message::Text(request.to_string().into()))
+        let (mut msg_id, mut payload) = request(&channel.session);
+        // A failed send never reached the kernel, so one fresh channel is safe.
+        if channel
+            .socket
+            .send(Message::Text(payload.to_string().into()))
             .await
-            .map_err(|_| unavailable("Kernel connection"))?;
+            .is_err()
+        {
+            channel = self.channel_to(None).await?;
+            (msg_id, payload) = request(&channel.session);
+            channel
+                .socket
+                .send(Message::Text(payload.to_string().into()))
+                .await
+                .map_err(|_| unavailable("Kernel connection"))?;
+        }
+        let Channel {
+            mut socket,
+            session,
+            kernel_id,
+            ..
+        } = channel;
+        let message = |channel: &str, kind: &str, parent: Value, content: Value| {
+            json!({
+                "header": {"msg_id": uuid::Uuid::new_v4().to_string(), "msg_type": kind, "session": session,
+                           "username": "colab-cli", "version": "5.3", "date": chrono::Utc::now().to_rfc3339()},
+                "parent_header": parent, "metadata": {}, "buffers": [], "channel": channel, "content": content,
+            })
+        };
         let mut outputs = Outputs {
             full,
             ..Outputs::default()
@@ -305,8 +394,7 @@ impl Kernel {
                 _ => None,
             };
             if let Some(content) = answer {
-                let (_, response) =
-                    message("stdin", "input_reply", incoming["header"].clone(), content);
+                let response = message("stdin", "input_reply", incoming["header"].clone(), content);
                 socket
                     .send(Message::Text(response.to_string().into()))
                     .await
@@ -323,8 +411,120 @@ impl Kernel {
                 other => outputs.push(other, content),
             }
         }
-        let _ = socket.close(None).await;
-        Ok(outputs.finish(reply))
+        config::trace("executed", started);
+        *self.open.lock().await = Some(Channel {
+            socket,
+            session: session.clone(),
+            kernel_id: kernel_id.clone(),
+            last_used: Instant::now(),
+        });
+        Ok((outputs.finish(reply), kernel_id))
+    }
+
+    /// Close a kept channel (end of a CLI command).
+    pub async fn close(&self) {
+        if let Some(mut channel) = self.open.lock().await.take() {
+            let _ = channel.socket.close(None).await;
+        }
+    }
+
+    /// Kernel by known id, or the session's kernel.
+    pub async fn kernel_id(&self, known: Option<&str>) -> Result<String> {
+        if let Some(id) = known
+            && self.state(id).await.is_ok()
+        {
+            return Ok(id.to_owned());
+        }
+        self.session().await
+    }
+
+    /// `idle`, `busy` or `starting`.
+    pub async fn state(&self, kernel_id: &str) -> Result<String> {
+        let kernel = self
+            .json(
+                reqwest::Method::GET,
+                self.url(&format!("api/kernels/{kernel_id}"))?,
+                None,
+                "Kernel state",
+            )
+            .await
+            .map_err(|error| {
+                if error.code == "not_found" {
+                    kernel_gone()
+                } else {
+                    error
+                }
+            })?;
+        Ok(kernel["execution_state"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned())
+    }
+
+    /// Interrupt the running cell (like the stop button), or restart the kernel.
+    pub async fn signal(&self, kernel_id: &str, action: &str) -> Result<()> {
+        let url = self.url(&format!("api/kernels/{kernel_id}/{action}"))?;
+        let response = self
+            .http
+            .post(url)
+            .timeout(Duration::from_secs(60))
+            .header(TOKEN_HEADER, &self.token)
+            // The runtime proxy answers 411 to a POST without Content-Length,
+            // and an empty body alone does not send one.
+            .header("content-length", "0")
+            .send()
+            .await
+            .map_err(|_| unavailable("Kernel control"))?;
+        match response.status().as_u16() {
+            200..=299 => Ok(()),
+            404 => Err(kernel_gone()),
+            status => Err(unavailable(&format!("Kernel control (HTTP {status})"))),
+        }
+    }
+
+    /// Up to `limit` bytes from the end of a runtime file, plus its total size.
+    pub async fn tail(&self, path: &str, limit: usize) -> Result<(Vec<u8>, Option<u64>)> {
+        let url = self.file_url("files/", &remote_parts(path)?)?;
+        let response = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(60))
+            .header(TOKEN_HEADER, &self.token)
+            .header("range", format!("bytes=-{limit}"))
+            .send()
+            .await
+            .map_err(|_| unavailable("Runtime file"))?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Err(Error::new(
+                "not_found",
+                format!("{path} does not exist on the runtime."),
+                "Check the path with `colab ls`.",
+            ));
+        }
+        if status == 416 {
+            return Ok((Vec::new(), Some(0)));
+        }
+        if !(200..300).contains(&status) {
+            return Err(unavailable("Runtime file"));
+        }
+        let total = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|v| v.parse().ok())
+            .or_else(|| (status == 200).then(|| response.content_length()).flatten());
+        // Without range support, keep only the end while streaming.
+        let mut kept: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            kept.extend(chunk.map_err(|_| unavailable("Runtime file"))?.iter());
+            while kept.len() > limit {
+                kept.pop_front();
+            }
+        }
+        Ok((kept.into_iter().collect(), total))
     }
 
     pub async fn list(&self, path: &str) -> Result<Value> {
@@ -467,6 +667,29 @@ pub struct Outputs {
     full: bool,
 }
 
+/// `text` already carries streams and tracebacks; keep only what it lacks.
+fn compact(items: Vec<Value>) -> Value {
+    Value::Array(
+        items
+            .into_iter()
+            .filter(|item| item["output_type"] != "stream")
+            .map(|mut item| {
+                if let Some(object) = item.as_object_mut().filter(|o| o["output_type"] == "error") {
+                    object.remove("traceback");
+                }
+                item
+            })
+            .filter(|item| {
+                // A result whose only data is the plain text already in `text`.
+                !(item["output_type"] == "execute_result"
+                    && item["data"]
+                        .as_object()
+                        .is_some_and(|d| d.len() == 1 && d.contains_key("text/plain")))
+            })
+            .collect(),
+    )
+}
+
 /// Keep the head and the most recent tail of a long text.
 pub fn clip(text: &str) -> (String, bool) {
     if text.len() <= STREAM_HEAD + STREAM_TAIL {
@@ -603,7 +826,7 @@ impl Outputs {
             "status": status,
             "execution_count": reply.as_ref().map_or(Value::Null, |r| r["execution_count"].clone()),
             "text": text,
-            "outputs": self.items,
+            "outputs": if full { Value::Array(self.items) } else { compact(self.items) },
             "truncated": self.truncated,
         });
         let mut notes = Vec::new();
@@ -652,12 +875,14 @@ mod tests {
             json!({"data": {"image/png": "iVBOR", "text/plain": "<Figure>"}, "metadata": {}}),
         );
         let result = outputs.finish(Some(json!({"status": "ok", "execution_count": 1})));
-        let text = result["outputs"][0]["text"].as_str().unwrap();
-        assert!(text.starts_with("step 0\n") && text.ends_with("step 39999\n"));
+        let text = result["text"].as_str().unwrap();
+        assert!(text.starts_with("step 0\n") && text.contains("step 39999\n"));
         assert!(text.len() < 70 * 1024);
-        assert_eq!(result["outputs"][1]["data"]["text/plain"], "<Figure>");
+        // Compact results leave streams to `text`; rich data stays in outputs.
+        assert_eq!(result["outputs"].as_array().unwrap().len(), 1);
+        assert_eq!(result["outputs"][0]["data"]["text/plain"], "<Figure>");
         assert!(
-            result["outputs"][1]["data"]["image/png"]
+            result["outputs"][0]["data"]["image/png"]
                 .as_str()
                 .unwrap()
                 .starts_with("[omitted")
@@ -676,6 +901,7 @@ mod tests {
         outputs.push("error", json!({"ename": "ValueError", "evalue": "bad", "traceback": ["\u{1b}[0;31mValueError\u{1b}[0m: bad"]}));
         let result = outputs.finish(Some(json!({"status": "error", "execution_count": 2})));
         assert_eq!(result["text"], "ValueError: bad\n");
+        assert!(result["outputs"][0].get("traceback").is_none());
         let timed_out = Outputs::default().finish(None);
         assert_eq!(timed_out["status"], "timeout");
         assert!(

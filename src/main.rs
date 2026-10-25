@@ -6,6 +6,7 @@ mod config;
 mod drive;
 mod error;
 mod google;
+mod jobs;
 mod kernel;
 mod mcp;
 mod ops;
@@ -21,6 +22,7 @@ use std::{io::Read, path::PathBuf};
 #[derive(Parser)]
 #[command(
     name = "colab",
+    bin_name = "colab",
     version,
     about = "Run code on Google Colab CPU/GPU/TPU runtimes and manage Colab notebooks and Drive files. Output is JSON."
 )]
@@ -91,9 +93,25 @@ enum Command {
         /// Seconds to wait for the result (1-3600); the code keeps running after a timeout.
         #[arg(long, default_value_t = 60)]
         timeout: u64,
+        /// Keep stdout and tracebacks in `outputs` too (they are always in `text`).
+        #[arg(long)]
+        full_outputs: bool,
         #[command(flatten)]
         machine: Machine,
     },
+    /// Stop the cell that is running in a slot (like the stop button).
+    Interrupt {
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Restart a slot's Python kernel (variables are cleared; files remain).
+    Restart {
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Background jobs for long work (training, installs) that keep the kernel free.
+    #[command(subcommand)]
+    Job(JobCommand),
     /// Stop a runtime (the default slot unless --slot, --endpoint or --all).
     Stop {
         #[command(flatten)]
@@ -136,6 +154,44 @@ enum Command {
     Notebook(NotebookCommand),
     /// Serve these features as MCP tools over stdio.
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum JobCommand {
+    /// Start Python (CODE, --file or stdin) or a shell command (--shell) in the background.
+    Start {
+        code: Option<String>,
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+        /// Treat the input as a bash script instead of Python.
+        #[arg(long)]
+        shell: bool,
+        /// Short name used as the job ID prefix.
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        machine: Machine,
+    },
+    /// State (running, succeeded, failed, stopped) and the end of the log.
+    Status {
+        job: String,
+        /// Log lines to return.
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Recent jobs on the runtime.
+    List {
+        #[command(flatten)]
+        target: Target,
+    },
+    /// Stop a job and all its child processes.
+    Stop {
+        job: String,
+        #[command(flatten)]
+        target: Target,
+    },
 }
 
 #[derive(Subcommand)]
@@ -231,12 +287,26 @@ enum NotebookCommand {
     },
 }
 
+/// Code from the argument, a file, or stdin (also for `-`).
+fn source(code: Option<String>, file: Option<PathBuf>) -> Result<String> {
+    Ok(match (code, file) {
+        (Some(_), Some(_)) => return Err(Error::input("Give CODE or --file, not both.")),
+        (Some(code), None) if code != "-" => code,
+        (None, Some(file)) => std::fs::read_to_string(file)?,
+        _ => {
+            let mut code = String::new();
+            std::io::stdin().read_to_string(&mut code)?;
+            code
+        }
+    })
+}
+
 async fn dispatch(command: Command) -> Result<Value> {
     if let Command::Mcp = command {
-        mcp::serve(App::new()?).await?;
+        mcp::serve(App::new(true)?).await?;
         return Ok(Value::Null);
     }
-    let app = App::new()?;
+    let app = App::new(false)?;
     let api = &app.api;
     Ok(match command {
         Command::Mcp => unreachable!(),
@@ -252,19 +322,67 @@ async fn dispatch(command: Command) -> Result<Value> {
             code,
             file,
             timeout,
+            full_outputs,
             machine,
         } => {
-            let code = match (code, file) {
-                (Some(_), Some(_)) => return Err(Error::input("Give CODE or --file, not both.")),
-                (Some(code), None) if code != "-" => code,
-                (None, Some(file)) => std::fs::read_to_string(file)?,
-                _ => {
-                    let mut code = String::new();
-                    std::io::stdin().read_to_string(&mut code)?;
-                    code
-                }
-            };
-            app.run(&code, &machine.slot, machine.hardware()?, timeout)
+            let code = source(code, file)?;
+            app.run(
+                &code,
+                &machine.slot,
+                machine.hardware()?,
+                timeout,
+                full_outputs,
+            )
+            .await?
+        }
+        Command::Interrupt { target } => {
+            app.signal(
+                "interrupt",
+                target.slot.as_deref(),
+                target.endpoint.as_deref(),
+            )
+            .await?
+        }
+        Command::Restart { target } => {
+            app.signal(
+                "restart",
+                target.slot.as_deref(),
+                target.endpoint.as_deref(),
+            )
+            .await?
+        }
+        Command::Job(JobCommand::Start {
+            code,
+            file,
+            shell,
+            name,
+            machine,
+        }) => {
+            let code = source(code, file)?;
+            app.job_start(
+                &code,
+                shell,
+                name.as_deref(),
+                &machine.slot,
+                machine.hardware()?,
+            )
+            .await?
+        }
+        Command::Job(JobCommand::Status { job, lines, target }) => {
+            app.job_status(
+                &job,
+                lines,
+                target.slot.as_deref(),
+                target.endpoint.as_deref(),
+            )
+            .await?
+        }
+        Command::Job(JobCommand::List { target }) => {
+            app.job_list(target.slot.as_deref(), target.endpoint.as_deref())
+                .await?
+        }
+        Command::Job(JobCommand::Stop { job, target }) => {
+            app.job_stop(&job, target.slot.as_deref(), target.endpoint.as_deref())
                 .await?
         }
         Command::Stop { target, all } => {

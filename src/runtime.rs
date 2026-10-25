@@ -88,12 +88,67 @@ pub struct Lease {
     pub url: String,
     pub token: String,
     pub accelerator: String,
+    pub expires_at: i64,
+    /// The slot this runtime belongs to, when known.
+    pub slot: Option<String>,
+    /// The slot's last kernel, reused to skip a session lookup.
+    pub kernel_id: Option<String>,
+    /// True when served from the local cache without asking Colab.
+    pub cached: bool,
+    /// Colab listed this runtime recently. A runtime stopped elsewhere keeps
+    /// answering for a while, so a cached one is re-confirmed before use.
+    pub confirmed: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+/// How long a cached runtime is trusted without asking Colab again.
+const CONFIRM_FOR: i64 = 60;
+
+/// What a slot remembers. The proxy token is private (file mode 0600) and
+/// only reused until shortly before Colab's stated expiry.
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct SlotRecord {
     endpoint: String,
     hardware: Option<Hardware>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    token: String,
+    #[serde(default)]
+    expires_at: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    kernel_id: String,
+    /// The last foreground run timed out, so the kernel may still be busy.
+    #[serde(default)]
+    busy: bool,
+    /// When Colab last listed this runtime.
+    #[serde(default)]
+    confirmed_at: i64,
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+impl SlotRecord {
+    fn cached_lease(&self, slot: &str) -> Option<Lease> {
+        (!self.url.is_empty() && !self.token.is_empty() && self.expires_at > now() + 120).then(
+            || Lease {
+                endpoint: self.endpoint.clone(),
+                url: self.url.clone(),
+                token: self.token.clone(),
+                accelerator: self
+                    .hardware
+                    .as_ref()
+                    .and_then(|h| h.accelerator.clone())
+                    .unwrap_or_else(|| "NONE".into()),
+                expires_at: self.expires_at,
+                slot: Some(slot.to_owned()),
+                kernel_id: (!self.kernel_id.is_empty()).then(|| self.kernel_id.clone()),
+                cached: true,
+                confirmed: self.confirmed_at > now() - CONFIRM_FOR,
+            },
+        )
+    }
 }
 
 fn slots_path(home: &Path) -> std::path::PathBuf {
@@ -138,7 +193,73 @@ fn lease_from(value: &Value) -> Option<Lease> {
         url: info["url"].as_str()?.to_owned(),
         token: info["token"].as_str()?.to_owned(),
         accelerator: value["accelerator"].as_str().unwrap_or("NONE").to_owned(),
+        expires_at: now() + info["tokenExpiresInSeconds"].as_i64().unwrap_or(3600),
+        slot: None,
+        kernel_id: None,
+        cached: false,
+        confirmed: true,
     })
+}
+
+/// Ask Colab whether a cached runtime is still assigned; remember a yes.
+pub async fn confirm(api: &Api, home: &Path, lease: &Lease) -> Result<bool> {
+    let present = assignments(api)
+        .await?
+        .iter()
+        .any(|a| a["endpoint"] == lease.endpoint.as_str());
+    let mut slots = load_slots(home);
+    let mut changed = false;
+    for record in slots.values_mut().filter(|r| r.endpoint == lease.endpoint) {
+        if present {
+            record.confirmed_at = now();
+        } else {
+            record.url.clear();
+            record.token.clear();
+            record.kernel_id.clear();
+            record.expires_at = 0;
+        }
+        changed = true;
+    }
+    if changed {
+        save_slots(home, &slots)?;
+    }
+    Ok(present)
+}
+
+/// Remember a slot's kernel and whether its last run may still be executing.
+pub fn remember_kernel(
+    home: &Path,
+    slot: &str,
+    endpoint: &str,
+    kernel_id: &str,
+    busy: bool,
+) -> Result<()> {
+    let mut slots = load_slots(home);
+    if let Some(record) = slots.get_mut(slot).filter(|r| r.endpoint == endpoint)
+        && (record.kernel_id != kernel_id || record.busy != busy)
+    {
+        record.kernel_id = kernel_id.to_owned();
+        record.busy = busy;
+        save_slots(home, &slots)?;
+    }
+    Ok(())
+}
+
+pub fn slot_busy(home: &Path, slot: &str) -> bool {
+    load_slots(home).get(slot).is_some_and(|r| r.busy)
+}
+
+/// Drop cached connection details after the runtime stopped answering.
+pub fn forget(home: &Path, slot: &str) -> Result<()> {
+    let mut slots = load_slots(home);
+    if let Some(record) = slots.get_mut(slot) {
+        record.url.clear();
+        record.token.clear();
+        record.kernel_id.clear();
+        record.expires_at = 0;
+        save_slots(home, &slots)?;
+    }
+    Ok(())
 }
 
 fn colab(path: &str) -> String {
@@ -196,9 +317,19 @@ pub async fn lease(
     home: &Path,
     slot: &str,
     hardware: Option<Hardware>,
+    use_cache: bool,
 ) -> Result<(Lease, bool)> {
     check_slot(slot)?;
     let mut slots = load_slots(home);
+    if use_cache
+        && let Some(record) = slots.get(slot)
+        && hardware
+            .as_ref()
+            .is_none_or(|h| record.hardware.as_ref() == Some(h))
+        && let Some(lease) = record.cached_lease(slot)
+    {
+        return Ok((lease, false));
+    }
     let hardware = match hardware {
         Some(hardware) => hardware,
         None => slots
@@ -268,24 +399,62 @@ pub async fn lease(
             )
         }
     };
+    let previous = slots.remove(slot).unwrap_or_default();
+    let same_runtime = previous.endpoint == lease.endpoint;
     slots.insert(
         slot.to_owned(),
         SlotRecord {
             endpoint: lease.endpoint.clone(),
             hardware: Some(hardware),
+            url: lease.url.clone(),
+            token: lease.token.clone(),
+            expires_at: lease.expires_at,
+            kernel_id: if same_runtime {
+                previous.kernel_id
+            } else {
+                String::new()
+            },
+            busy: same_runtime && previous.busy,
+            confirmed_at: now(),
         },
     );
     save_slots(home, &slots)?;
+    let record = &slots[slot];
+    let lease = Lease {
+        slot: Some(slot.to_owned()),
+        kernel_id: (!record.kernel_id.is_empty()).then(|| record.kernel_id.clone()),
+        ..lease
+    };
     Ok((lease, allocated))
 }
 
-/// Find a running runtime without allocating one.
+/// Find a running runtime without allocating one. The cache answers when it
+/// identifies exactly one runtime; callers retry with `use_cache = false`
+/// when a cached runtime no longer answers.
 pub async fn existing(
     api: &Api,
     home: &Path,
     slot: Option<&str>,
     endpoint: Option<&str>,
+    use_cache: bool,
 ) -> Result<Lease> {
+    let slots = load_slots(home);
+    if use_cache {
+        let cached: Vec<Lease> = slots
+            .iter()
+            .filter(|(name, record)| match (endpoint, slot) {
+                (Some(endpoint), _) => record.endpoint == endpoint,
+                (None, Some(slot)) => name.as_str() == slot,
+                (None, None) => true,
+            })
+            .filter_map(|(name, record)| record.cached_lease(name))
+            .collect();
+        if let [one] = cached.as_slice()
+            && (one.confirmed || confirm(api, home, one).await?)
+        {
+            return Ok(one.clone());
+        }
+    }
     let list = assignments(api).await?;
     let wanted = match (endpoint, slot) {
         (Some(endpoint), _) => Some(endpoint.to_owned()),
@@ -300,7 +469,23 @@ pub async fn existing(
         None => list.iter().collect(),
     };
     match candidates.as_slice() {
-        [one] => lease_from(one).ok_or_else(|| Error::network("Runtime lookup")),
+        [one] => {
+            let mut lease = lease_from(one).ok_or_else(|| Error::network("Runtime lookup"))?;
+            let mut slots = slots;
+            if let Some((name, record)) =
+                slots.iter_mut().find(|(_, r)| r.endpoint == lease.endpoint)
+            {
+                lease.slot = Some(name.clone());
+                lease.kernel_id = (!record.kernel_id.is_empty()).then(|| record.kernel_id.clone());
+                // Refresh the cache so the next command skips this lookup.
+                record.url = lease.url.clone();
+                record.token = lease.token.clone();
+                record.expires_at = lease.expires_at;
+                record.confirmed_at = now();
+                save_slots(home, &slots)?;
+            }
+            Ok(lease)
+        }
         [] => Err(Error::new(
             "no_runtime",
             "No matching runtime is running.",

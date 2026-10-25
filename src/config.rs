@@ -68,3 +68,11 @@ pub fn auth_url() -> String {
 pub fn allow_loopback() -> bool {
     std::env::var("COLAB_CLI_ALLOW_LOOPBACK").is_ok_and(|v| v == "1")
 }
+
+/// `COLAB_CLI_TRACE=1` prints phase timings to stderr, for diagnosing latency.
+pub fn trace(phase: &str, started: std::time::Instant) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("COLAB_CLI_TRACE").is_ok_and(|v| v == "1")) {
+        eprintln!("[trace] {phase}: {} ms", started.elapsed().as_millis());
+    }
+}

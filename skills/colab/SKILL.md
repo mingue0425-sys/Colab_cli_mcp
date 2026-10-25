@@ -12,6 +12,8 @@ Use the `colab` MCP tools when they are connected (`colab_run`, `colab_stop`, `c
 | Eligible GPUs/TPUs, compute units | `colab_usage` | `colab usage` |
 | Running runtimes | `colab_status` | `colab status` |
 | Run code (one notebook cell) | `colab_run` | `colab run 'CODE'`, `colab run -f script.py`, or stdin |
+| Long work in the background | `colab_job_start`, `colab_job_status`, `colab_job_stop` | `colab job start -f train.py`, `colab job status JOB`, `colab job list` |
+| Stop a stuck cell / reset Python | `colab_interrupt`, `colab_restart` | `colab interrupt`, `colab restart` |
 | Stop runtimes | `colab_stop` | `colab stop [--slot S \| --endpoint E \| --all]` |
 | Files on the runtime | `colab_ls`, `colab_download`, `colab_upload` | `colab ls content`, `colab download content/out/x.png`, `colab upload local.csv` |
 | Drive files | `drive_search`, `drive_download`, `drive_upload` | `colab drive search "name contains 'x' and trashed=false"` |
@@ -27,23 +29,19 @@ Use the `colab` MCP tools when they are connected (`colab_run`, `colab_stop`, `c
 ## Results
 
 - Check `status`: `ok`, `error` (Python exception; see `text`), or `timeout`. In the CLI, exit codes are 1 for error and 124 for timeout.
-- Read `text` first. `outputs` holds nbformat outputs.
+- Read `text` first: it holds prints, results and tracebacks. `outputs` only adds what `text` lacks (rich data such as tables, error names).
 - Long logs keep their beginning and their newest part. Images and large rich outputs are replaced by `[omitted: N bytes]`. Save such results to files (`plt.savefig("/content/out/plot.png")`) and fetch them with `colab_download`; the result gives the local path.
 - Follow any `note`.
 
 ## Long jobs
 
-`timeout` defaults to 60 s (max 3600). After a timeout the code keeps running and the kernel stays busy. For training, start a background process and poll its log with short runs:
+`timeout` defaults to 60 s (max 3600). Anything longer than a minute or two, such as training, large installs or downloads, belongs in a background job:
 
-```python
-import subprocess
-open("/content/train.py", "w").write(SCRIPT)
-subprocess.Popen("python /content/train.py > /content/train.log 2>&1", shell=True)
-```
+- `colab_job_start` with `code` (Python) or `shell: true` (bash), optional `name` and the same hardware/slot inputs as `colab_run`. It returns a `job` ID at once.
+- Poll with `colab_job_status` (`job`, `lines`). It reports `state` (`running`, `succeeded`, `failed`, `stopped`), `exit_code` and the end of the log. It works even while the kernel is busy. Print progress in the script so the log is useful.
+- `colab_job_stop` ends the job and its child processes.
 
-```python
-print(open("/content/train.log").read()[-3000:])
-```
+If a foreground run times out, its code keeps running and the next run in that slot returns `kernel_busy` immediately. Either wait, or call `colab_interrupt` (keeps variables). `colab_restart` clears all Python state but keeps files and jobs.
 
 ## Keeping results
 
