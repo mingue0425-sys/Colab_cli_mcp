@@ -19,7 +19,10 @@ def run_job(source, kind="python", after=None):
         f.write(source)
     env = dict(os.environ, COLAB_CLI_JOB_EVERY="0.2")
     subprocess.run([sys.executable, RUNNER, job, kind] + ([after] if after else []), env=env, check=True, timeout=60)
-    read = lambda name: open(os.path.join(job, name)).read()
+    def read(name):
+        with open(os.path.join(job, name)) as f:
+            return f.read()
+
     return read("exit_code"), json.loads(read("stats.json")), read("log"), read("memory.jsonl")
 
 

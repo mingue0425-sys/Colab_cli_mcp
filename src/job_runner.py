@@ -112,6 +112,10 @@ def ended(job_dir):
 
 def main(job_dir, kind, after=None):
     me = os.getpid()
+    # Lead a process group (colab-cli starts us in a new session already), so
+    # memory is summed over the job's processes and `job stop` reaches them all.
+    if os.getpgrp() != me:
+        os.setpgid(0, 0)
     set_oom_score(-1000)
     script = os.path.join(job_dir, "main.py" if kind == "python" else "main.sh")
     argv = [sys.executable, "-u", script] if kind == "python" else ["bash", script]
