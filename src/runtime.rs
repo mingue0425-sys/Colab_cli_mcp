@@ -128,23 +128,32 @@ struct SlotRecord {
     last_used: i64,
 }
 
+/// The longest idle auto-stop (one week). Larger values are capped so the
+/// seconds arithmetic can never wrap negative and stop runtimes at once.
+pub const MAX_IDLE_STOP: u64 = 7 * 24 * 60;
+
 /// Minutes without use after which colab-cli stops a runtime it manages
 /// (0 disables). `COLAB_CLI_IDLE_STOP` overrides the saved setting.
 pub fn idle_stop_minutes(home: &Path) -> u64 {
-    if let Some(minutes) = std::env::var("COLAB_CLI_IDLE_STOP")
+    let minutes = std::env::var("COLAB_CLI_IDLE_STOP")
         .ok()
         .and_then(|v| v.parse().ok())
-    {
-        return minutes;
-    }
-    std::fs::read(home.join("config.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
-        .and_then(|config| config["idle_stop_minutes"].as_u64())
-        .unwrap_or(30)
+        .or_else(|| {
+            std::fs::read(home.join("config.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+                .and_then(|config| config["idle_stop_minutes"].as_u64())
+        })
+        .unwrap_or(30);
+    minutes.min(MAX_IDLE_STOP)
 }
 
 pub fn set_idle_stop_minutes(home: &Path, minutes: u64) -> Result<()> {
+    if minutes > MAX_IDLE_STOP {
+        return Err(Error::input(format!(
+            "Idle auto-stop takes 0 (off) to {MAX_IDLE_STOP} minutes (one week)."
+        )));
+    }
     config::write_private(
         &home.join("config.json"),
         &serde_json::to_vec_pretty(&json!({"idle_stop_minutes": minutes}))?,
@@ -671,6 +680,27 @@ pub async fn propagate(api: &Api, endpoint: &str, auth_type: &str) -> Result<Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_stop_minutes_stay_in_range() {
+        let home = std::env::temp_dir().join(format!("colab-cli-test-{}", uuid::Uuid::new_v4()));
+        assert_eq!(idle_stop_minutes(&home), 30);
+        set_idle_stop_minutes(&home, MAX_IDLE_STOP).unwrap();
+        assert_eq!(idle_stop_minutes(&home), MAX_IDLE_STOP);
+        assert_eq!(
+            set_idle_stop_minutes(&home, MAX_IDLE_STOP + 1)
+                .unwrap_err()
+                .code,
+            "bad_input"
+        );
+        // A hand-edited huge value must not wrap negative and stop runtimes at once.
+        std::fs::write(
+            home.join("config.json"),
+            r#"{"idle_stop_minutes": 9223372036854775808}"#,
+        )
+        .unwrap();
+        assert_eq!(idle_stop_minutes(&home), MAX_IDLE_STOP);
+    }
 
     #[test]
     fn notebook_hash_is_stable_and_44_chars() {
