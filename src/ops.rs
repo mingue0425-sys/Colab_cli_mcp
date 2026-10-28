@@ -271,7 +271,7 @@ impl App {
             ]
         };
         for endpoint in &endpoints {
-            runtime::stop(&self.api, &self.home, endpoint).await?;
+            runtime::stop(&self.api, &self.home, endpoint, "colab stop").await?;
             self.kernels
                 .lock()
                 .await
@@ -290,9 +290,12 @@ impl App {
         }
         let mut watching = 0;
         let now = chrono::Utc::now().timestamp();
+        let listed = runtime::assignments(&self.api).await?;
+        // Checked every minute, so a runtime Colab ends is recorded promptly.
+        runtime::reconcile(&self.home, &listed)?;
         let managed = runtime::managed(&self.home);
         let mut stopped = Vec::new();
-        for assignment in runtime::assignments(&self.api).await? {
+        for assignment in listed {
             let Some((_, endpoint, last_used)) = managed
                 .iter()
                 .find(|(_, endpoint, _)| assignment["endpoint"] == endpoint.as_str())
@@ -333,7 +336,7 @@ impl App {
             if running_job {
                 continue;
             }
-            runtime::stop(&self.api, &self.home, endpoint).await?;
+            runtime::stop(&self.api, &self.home, endpoint, "idle auto-stop").await?;
             stopped.push(endpoint.clone());
             watching -= 1;
         }

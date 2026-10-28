@@ -126,6 +126,82 @@ struct SlotRecord {
     /// When colab-cli last used this runtime; drives the idle auto-stop.
     #[serde(default)]
     last_used: i64,
+    /// When colab-cli allocated this runtime (0 when it found one already running).
+    #[serde(default)]
+    started_at: i64,
+}
+
+fn events_path(home: &Path) -> std::path::PathBuf {
+    home.join("events.jsonl")
+}
+
+/// Append a runtime event (started, stopped, gone) to the account's history.
+pub fn record_event(home: &Path, mut event: Value) {
+    use std::io::Write;
+    event["time"] = chrono::Utc::now().to_rfc3339().into();
+    event["at"] = now().into();
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path(home))
+    {
+        let _ = writeln!(file, "{event}");
+    }
+}
+
+/// Events from the last `seconds`, newest last (the file's tail only).
+pub fn recent_events(home: &Path, seconds: i64) -> Vec<Value> {
+    let text = std::fs::read_to_string(events_path(home)).unwrap_or_default();
+    let mut events: Vec<Value> = text
+        .lines()
+        .rev()
+        .take(200)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|e| e["at"].as_i64().is_some_and(|at| now() - at <= seconds))
+        .collect();
+    events.reverse();
+    events
+}
+
+/// Record that Colab ended a runtime colab-cli did not stop, with how long it
+/// ran and sat idle, which hints at the reason (idle reclaim, lifetime limit).
+fn note_gone(home: &Path, slot: &str, record: &SlotRecord) {
+    let minutes = |since: i64| (since > 0).then(|| (now() - since) / 60);
+    record_event(
+        home,
+        json!({
+            "event": "runtime_gone", "slot": slot, "endpoint": record.endpoint,
+            "accelerator": record.hardware.as_ref().and_then(|h| h.accelerator.clone()),
+            "age_minutes": minutes(record.started_at), "idle_minutes": minutes(record.last_used),
+            "note": "Colab ended this runtime; colab-cli did not stop it. Long age suggests the runtime lifetime limit; long idle suggests an idle reclaim.",
+        }),
+    );
+}
+
+/// Forget managed runtimes Colab no longer lists, recording each as gone.
+/// The slot keeps its hardware for the next run.
+pub fn reconcile(home: &Path, listed: &[Value]) -> Result<()> {
+    let mut slots = load_slots(home);
+    let mut changed = false;
+    for (slot, record) in slots.iter_mut() {
+        if record.endpoint.is_empty()
+            || listed
+                .iter()
+                .any(|a| a["endpoint"] == record.endpoint.as_str())
+        {
+            continue;
+        }
+        note_gone(home, slot, record);
+        *record = SlotRecord {
+            hardware: record.hardware.take(),
+            ..SlotRecord::default()
+        };
+        changed = true;
+    }
+    if changed {
+        save_slots(home, &slots)?;
+    }
+    Ok(())
 }
 
 /// The longest idle auto-stop (one week). Larger values are capped so the
@@ -269,10 +345,11 @@ fn lease_from(value: &Value) -> Option<Lease> {
 
 /// Ask Colab whether a cached runtime is still assigned; remember a yes.
 pub async fn confirm(api: &Api, home: &Path, lease: &Lease) -> Result<bool> {
-    let present = assignments(api)
-        .await?
+    let listed = assignments(api).await?;
+    let present = listed
         .iter()
         .any(|a| a["endpoint"] == lease.endpoint.as_str());
+    reconcile(home, &listed)?;
     let mut slots = load_slots(home);
     let mut changed = false;
     for record in slots.values_mut().filter(|r| r.endpoint == lease.endpoint) {
@@ -361,6 +438,7 @@ pub async fn status(api: &Api, home: &Path) -> Result<Value> {
     let slots = load_slots(home);
     let idle_stop = idle_stop_minutes(home) as i64;
     let listed = assignments(api).await?;
+    reconcile(home, &listed)?;
     // Resource use per runtime, fetched in parallel; a runtime that does not
     // answer simply has none.
     let resources = futures_util::future::join_all(listed.iter().map(|a| async move {
@@ -384,14 +462,22 @@ pub async fn status(api: &Api, home: &Path) -> Result<Value> {
             })
         })
         .collect();
-    Ok(json!({
+    let gone: Vec<Value> = recent_events(home, 24 * 3600)
+        .into_iter()
+        .filter(|e| e["event"] == "runtime_gone")
+        .collect();
+    let mut out = json!({
         "runtimes": runtimes,
         "auto_stop": if idle_stop > 0 {
             json!(format!("Runtimes started by colab-cli stop after {idle_stop} idle minutes (no runs, no busy kernel, no running job). Change with `colab idle-stop MINUTES`; 0 disables."))
         } else {
             json!("Disabled; stop runtimes with `colab stop`.")
         },
-    }))
+    });
+    if !gone.is_empty() {
+        out["gone_recently"] = gone.into();
+    }
+    Ok(out)
 }
 
 /// Find or allocate the slot's runtime. Without explicit hardware, the slot's
@@ -485,6 +571,12 @@ pub async fn lease(
     };
     let previous = slots.remove(slot).unwrap_or_default();
     let same_runtime = previous.endpoint == lease.endpoint;
+    if allocated {
+        record_event(
+            home,
+            json!({"event": "runtime_started", "slot": slot, "endpoint": lease.endpoint, "accelerator": hardware.accelerator}),
+        );
+    }
     slots.insert(
         slot.to_owned(),
         SlotRecord {
@@ -501,6 +593,13 @@ pub async fn lease(
             busy: same_runtime && previous.busy,
             confirmed_at: now(),
             last_used: now(),
+            started_at: if same_runtime {
+                previous.started_at
+            } else if allocated {
+                now()
+            } else {
+                0
+            },
         },
     );
     save_slots(home, &slots)?;
@@ -591,7 +690,8 @@ pub async fn existing(
     }
 }
 
-pub async fn stop(api: &Api, home: &Path, endpoint: &str) -> Result<()> {
+/// Stop a runtime; `by` says who asked (recorded in the event history).
+pub async fn stop(api: &Api, home: &Path, endpoint: &str, by: &str) -> Result<()> {
     if endpoint.is_empty()
         || !endpoint
             .bytes()
@@ -626,6 +726,10 @@ pub async fn stop(api: &Api, home: &Path, endpoint: &str) -> Result<()> {
     let mut slots = load_slots(home);
     slots.retain(|_, record| record.endpoint != endpoint);
     save_slots(home, &slots)?;
+    record_event(
+        home,
+        json!({"event": "runtime_stopped", "endpoint": endpoint, "by": by}),
+    );
     Ok(())
 }
 
@@ -689,6 +793,41 @@ pub async fn propagate(api: &Api, endpoint: &str, auth_type: &str) -> Result<Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gone_runtimes_are_recorded_once_and_slots_keep_hardware() {
+        let home = std::env::temp_dir().join(format!("colab-cli-test-{}", uuid::Uuid::new_v4()));
+        let gpu = Hardware::from_flags(Some("T4"), None, false).unwrap();
+        let mut slots = BTreeMap::new();
+        for (slot, endpoint) in [("train", "gone-1"), ("live", "here-1")] {
+            slots.insert(
+                slot.to_owned(),
+                SlotRecord {
+                    endpoint: endpoint.into(),
+                    hardware: gpu.clone(),
+                    started_at: now() - 3 * 3600,
+                    last_used: now() - 600,
+                    ..SlotRecord::default()
+                },
+            );
+        }
+        save_slots(&home, &slots).unwrap();
+        let listed = [json!({"endpoint": "here-1"})];
+        reconcile(&home, &listed).unwrap();
+        reconcile(&home, &listed).unwrap();
+        let events = recent_events(&home, 60);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (
+                events[0]["slot"].as_str(),
+                events[0]["age_minutes"].as_i64()
+            ),
+            (Some("train"), Some(180))
+        );
+        let slots = load_slots(&home);
+        assert!(slots["train"].endpoint.is_empty() && slots["train"].hardware == gpu);
+        assert_eq!(slots["live"].endpoint, "here-1");
+    }
 
     #[test]
     fn idle_stop_minutes_stay_in_range() {
