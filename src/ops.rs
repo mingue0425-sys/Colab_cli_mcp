@@ -68,6 +68,20 @@ fn append_note(result: &mut Value, note: &str) {
     result["note"] = combined.into();
 }
 
+/// The job supervisor's latest record, if it wrote one (jobs started by
+/// colab-cli 0.3 and earlier have none).
+async fn job_stats(kernel: &Kernel, dir: &str) -> Option<Value> {
+    let (bytes, _) = kernel
+        .tail(&format!("{dir}/stats.json"), 64 * 1024)
+        .await
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn now() -> f64 {
+    chrono::Utc::now().timestamp_millis() as f64 / 1000.0
+}
+
 fn kernel_busy() -> Error {
     Error::new(
         "kernel_busy",
@@ -528,10 +542,16 @@ impl App {
                 Err(error) => return Err(error),
             };
             let cut = total.is_some_and(|total| total > log.len() as u64);
-            Ok(json!({
-                "job": id, "state": jobs::state(exit_code), "exit_code": exit_code,
-                "log_bytes": total, "log_tail": jobs::last_lines(&log, lines, cut),
-            }))
+            let stats = job_stats(&kernel, &dir).await;
+            let mut status = jobs::describe(exit_code, stats.as_ref(), now());
+            status["job"] = id.into();
+            status["log_bytes"] = total.into();
+            status["log_tail"] = jobs::last_lines(&log, lines, cut).into();
+            if stats.is_some() {
+                status["memory_log"] =
+                    format!("{}/memory.jsonl", dir.trim_start_matches('/')).into();
+            }
+            Ok(status)
         })
     }
 
@@ -564,7 +584,14 @@ impl App {
                     .and_then(|(bytes, _)| {
                         String::from_utf8_lossy(&bytes).trim().parse::<i64>().ok()
                     });
-                jobs.push(json!({"job": id, "state": jobs::state(exit_code), "exit_code": exit_code, "last_modified": entry["last_modified"]}));
+                // Stats only matter for telling running from lost, and why a job was killed.
+                let stats = match exit_code {
+                    None | Some(137) => job_stats(&kernel, &jobs::dir(id)).await,
+                    Some(_) => None,
+                };
+                let described = jobs::describe(exit_code, stats.as_ref(), now());
+                jobs.push(json!({"job": id, "state": described["state"], "exit_code": exit_code,
+                                 "likely_cause": described["likely_cause"], "last_modified": entry["last_modified"]}));
             }
             Ok(json!({"jobs": jobs}))
         })

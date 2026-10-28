@@ -39,8 +39,9 @@ Use the `colab` MCP tools when they are connected (`colab_run`, `colab_stop`, `c
 `timeout` defaults to 60 s (max 3600). Anything longer than a minute or two, such as training, large installs or downloads, belongs in a background job:
 
 - `colab_job_start` with `code` (Python) or `shell: true` (bash), optional `name` and the same hardware/slot inputs as `colab_run`. It returns a `job` ID at once.
-- Then call `colab_job_wait` (`job`, `timeout` up to 3600 s). It returns once the job ends, with `state` (`running`, `succeeded`, `failed`, `stopped`), `exit_code` and the end of the log. One wait replaces many status polls. `colab_job_status` gives the same snapshot immediately and works while the kernel is busy. Print progress in the script so the log is useful; progress bars are reduced to their last state.
+- Then call `colab_job_wait` (`job`, `timeout` up to 3600 s). It returns once the job ends, with `state` (`running`, `succeeded`, `failed`, `stopped`, `killed`, `lost`), `exit_code`, `memory` (`peak_job_mb`, `min_available_mb`, `total_mb`) and the end of the log. One wait replaces many status polls. `colab_job_status` gives the same snapshot immediately and works while the kernel is busy. Print progress in the script so the log is useful; progress bars are reduced to their last state.
 - `colab_job_stop` ends the job and its child processes.
+- Memory: `colab_job_status` shows a running job's memory and the runtime's available memory, so there is no need to log memory yourself or rely on `/usr/bin/time`. When `likely_cause` is `out_of_memory`, follow its `next_step`. Run fewer things at once, split independent work into separate jobs (one failure then leaves the others running and each reports its own peak), or use `high_ram`.
 
 If a foreground run times out, its code keeps running and the next run in that slot returns `kernel_busy` immediately. Either wait, or call `colab_interrupt` (keeps variables). `colab_restart` clears all Python state but keeps files and jobs.
 

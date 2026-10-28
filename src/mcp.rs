@@ -17,7 +17,9 @@ const INSTRUCTIONS: &str = "Google Colab tools. colab_run executes Python like a
 (CPU by default; gpu: \"T4\" or tpu: \"V5E1\"; check colab_usage for eligible hardware). Runs with the same slot share \
 one runtime and its variables, and a slot remembers its hardware. Read status (ok, error, timeout) and text. \
 For anything longer than a minute or two (training, large installs, downloads) use colab_job_start, then \
-colab_job_wait (blocks until it ends) or colab_job_status; jobs run while the kernel stays free. If a run times out, \
+colab_job_wait (blocks until it ends) or colab_job_status; jobs run while the kernel stays free. Job results include memory \
+(peak use and the runtime's minimum available) and, for a job killed for lack of memory, likely_cause out_of_memory: \
+then run less at once or split work into separate jobs. If a run times out, \
 the kernel is busy until it finishes: colab_interrupt stops it. Images and large outputs are omitted from results: \
 save them to files and fetch them with colab_download. Files under /content disappear when the runtime stops. To keep \
 results in Google Drive use colab_save_to_drive with a folder path (created if missing); it needs no approval. Mount \
@@ -140,7 +142,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "colab_job_status",
-            "A job's state (running, succeeded, failed, stopped), exit code and last log lines. Without job, lists recent jobs.",
+            "A job's state (running, succeeded, failed, stopped, killed, lost), memory (job peak, runtime minimum available), exit code and last log lines; likely_cause out_of_memory when it was killed for lack of memory. Without job, lists recent jobs.",
             schema(
                 merge(
                     target(),

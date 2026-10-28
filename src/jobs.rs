@@ -37,28 +37,32 @@ pub fn dir(id: &str) -> String {
     format!("/{ROOT}/{id}")
 }
 
-/// Python run by the kernel to launch the job detached from it. Values are
-/// embedded as JSON string literals, which are valid Python literals.
+/// The supervisor that runs a job and records its memory and outcome.
+const RUNNER: &str = include_str!("job_runner.py");
+
+/// Python run by the kernel to launch the job detached from it, under the
+/// supervisor. Values are embedded as JSON string literals, which are valid
+/// Python literals.
 pub fn start_snippet(id: &str, source: &str, shell: bool) -> Result<String> {
-    let dir = dir(id);
-    let (file, command) = if shell {
-        ("main.sh", format!("cd /content && bash {dir}/main.sh"))
+    let (file, kind) = if shell {
+        ("main.sh", "shell")
     } else {
-        ("main.py", format!("cd /content && python -u {dir}/main.py"))
+        ("main.py", "python")
     };
-    let wrapped = format!("{command} > {dir}/log 2>&1; echo $? > {dir}/exit_code");
     Ok(format!(
         r#"import json as _j, os as _o, subprocess as _s
 _d = {dir}
 _o.makedirs(_d, exist_ok=True)
 open(_o.path.join(_d, {file}), "w").write({source})
-_p = _s.Popen(["bash", "-c", {wrapped}], start_new_session=True, stdin=_s.DEVNULL, stdout=_s.DEVNULL, stderr=_s.DEVNULL)
+open(_o.path.join(_d, "runner.py"), "w").write({runner})
+_p = _s.Popen(["python", _o.path.join(_d, "runner.py"), _d, {kind}], cwd="/content", start_new_session=True, stdin=_s.DEVNULL, stdout=_s.DEVNULL, stderr=_s.DEVNULL)
 open(_o.path.join(_d, "pid"), "w").write(str(_p.pid))
 print(_j.dumps({{"job": {id}, "pid": _p.pid}}))"#,
-        dir = serde_json::to_string(&dir)?,
+        dir = serde_json::to_string(&dir(id))?,
         file = serde_json::to_string(file)?,
         source = serde_json::to_string(source)?,
-        wrapped = serde_json::to_string(&wrapped)?,
+        runner = serde_json::to_string(RUNNER)?,
+        kind = serde_json::to_string(kind)?,
         id = serde_json::to_string(id)?,
     ))
 }
@@ -147,13 +151,68 @@ pub fn last_lines(bytes: &[u8], lines: usize, cut: bool) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
-pub fn state(exit_code: Option<i64>) -> Value {
-    match exit_code {
-        None => json!("running"),
-        Some(0) => json!("succeeded"),
-        Some(-15) => json!("stopped"),
-        Some(_) => json!("failed"),
+/// A supervisor silent for this long without recording an end has died with
+/// its job (or the runtime restarted). Generous, because a runtime short of
+/// memory can stall it.
+const LOST_AFTER: f64 = 120.0;
+
+fn mb(stats: &Value, key: &str) -> Value {
+    stats[key]
+        .as_f64()
+        .map_or(Value::Null, |b| json!((b / 1_048_576.0).round() as i64))
+}
+
+/// State, memory and the likely cause of an unclean end, from the exit code
+/// and the supervisor's stats.json (absent for jobs started by older versions).
+pub fn describe(exit_code: Option<i64>, stats: Option<&Value>, now: f64) -> Value {
+    let mut out = json!({"exit_code": exit_code});
+    let silent = stats
+        .and_then(|s| s["updated_at"].as_f64())
+        .is_some_and(|t| now - t > LOST_AFTER);
+    out["state"] = json!(match exit_code {
+        None if silent => "lost",
+        None => "running",
+        Some(0) => "succeeded",
+        Some(-15) => "stopped",
+        Some(137) => "killed",
+        Some(_) => "failed",
+    });
+    let Some(stats) = stats else { return out };
+    let mut memory = json!({
+        "total_mb": mb(stats, "total"),
+        "peak_job_mb": mb(stats, "peak_rss"),
+        "min_available_mb": mb(stats, "min_available"),
+    });
+    if exit_code.is_none() {
+        memory["job_mb"] = mb(stats, "rss");
+        memory["available_mb"] = mb(stats, "available");
+    } else if stats["max_process_rss"].is_number() {
+        memory["largest_process_mb"] = mb(stats, "max_process_rss");
     }
+    out["memory"] = memory;
+    // Little memory left in the last minute before a SIGKILL or a silent death.
+    let total = stats["total"].as_f64().unwrap_or(0.0);
+    let low = stats["recent_min_available"]
+        .as_f64()
+        .is_some_and(|a| total > 0.0 && a < total * 0.1);
+    let (cause, next_step) = match out["state"].as_str() {
+        Some("killed" | "lost") if low => (
+            "out_of_memory",
+            "The runtime ran out of memory. Use less at once (fewer parallel processes, smaller batches or buffers, streaming reads), split the work into separate jobs, or use --high-ram.",
+        ),
+        Some("killed") => (
+            "killed",
+            "Something sent SIGKILL (not `job stop`); memory looked fine, so check the log for what else could have ended it.",
+        ),
+        Some("lost") => (
+            "lost",
+            "The job's supervisor stopped reporting without recording an end; the runtime may have restarted or be overloaded. Check `colab status` and the log.",
+        ),
+        _ => return out,
+    };
+    out["likely_cause"] = cause.into();
+    out["next_step"] = next_step.into();
+    out
 }
 
 #[cfg(test)]
@@ -165,14 +224,69 @@ mod tests {
         let snippet = start_snippet("job-1", "print(\"a\\\"b\")\n'''", false).unwrap();
         assert!(snippet.contains(r#"_d = "/content/.colab-cli/jobs/job-1""#));
         assert!(snippet.contains(r#""print(\"a\\\"b\")\n'''""#));
-        assert!(snippet.contains("python -u /content/.colab-cli/jobs/job-1/main.py"));
-        assert!(
-            start_snippet("x", "ls", true)
-                .unwrap()
-                .contains("bash /content/.colab-cli/jobs/x/main.sh")
-        );
+        assert!(snippet.contains(r#"_d, "python"]"#));
+        assert!(snippet.contains("def group_rss"));
+        let shell = start_snippet("x", "ls", true).unwrap();
+        assert!(shell.contains(r#""main.sh""#) && shell.contains(r#"_d, "shell"]"#));
         assert!(check_id("../x").is_err());
         assert!(new_id(Some("train")).unwrap().starts_with("train-"));
+    }
+
+    #[test]
+    fn start_snippet_is_valid_python() {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let check = "import ast, sys; ast.parse(sys.stdin.read())";
+        let Ok(mut python) = Command::new("python3")
+            .args(["-c", check])
+            .stdin(Stdio::piped())
+            .spawn()
+        else {
+            return; // No Python here; CI has it.
+        };
+        let snippet = start_snippet("j", "print('''x''')\n", false).unwrap();
+        python
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(snippet.as_bytes())
+            .unwrap();
+        assert!(python.wait().unwrap().success());
+    }
+
+    #[test]
+    fn outcomes_and_memory_are_described() {
+        const GB: f64 = 1_073_741_824.0;
+        let now = 1000.0;
+        assert_eq!(describe(None, None, now)["state"], "running");
+        assert_eq!(describe(Some(-15), None, now)["state"], "stopped");
+        let running = json!({"updated_at": 990.0, "total": 12.0 * GB, "available": 4.0 * GB,
+                             "rss": 6.0 * GB, "peak_rss": 7.0 * GB, "min_available": 3.0 * GB,
+                             "recent_min_available": 3.0 * GB});
+        let status = describe(None, Some(&running), now);
+        assert_eq!(status["state"], "running");
+        assert_eq!(status["memory"]["job_mb"], 6144);
+        assert!(status.get("likely_cause").is_none());
+        // Silent supervisor, low memory just before: lost to out-of-memory.
+        let mut starved = running.clone();
+        starved["recent_min_available"] = json!(0.5 * GB);
+        let lost = describe(None, Some(&starved), now + 200.0);
+        assert_eq!(
+            (lost["state"].as_str(), lost["likely_cause"].as_str()),
+            (Some("lost"), Some("out_of_memory"))
+        );
+        let killed = describe(Some(137), Some(&starved), now);
+        assert_eq!(
+            (killed["state"].as_str(), killed["likely_cause"].as_str()),
+            (Some("killed"), Some("out_of_memory"))
+        );
+        let killed = describe(Some(137), Some(&running), now);
+        assert_eq!(killed["likely_cause"], "killed");
+        let failed = describe(Some(1), Some(&starved), now);
+        assert_eq!(failed["state"], "failed");
+        assert!(failed.get("likely_cause").is_none());
     }
 
     #[test]

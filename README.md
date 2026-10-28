@@ -27,7 +27,7 @@ State lives in `$COLAB_CLI_HOME` (default `~/.colab-cli`): `token.json` (owner-o
 | `colab interrupt` / `colab restart` | Stop the running cell (variables kept) / restart the kernel (variables cleared) |
 | `colab job start [CODE \| -f FILE \| stdin] [--shell] [--name N]` | Run long work as a background process; returns a job ID at once |
 | `colab job wait JOB [--timeout S]` | Block until the job ends, then print its status |
-| `colab job status JOB [--lines N]` / `job list` / `job stop JOB` | State (`running`, `succeeded`, `failed`, `stopped`), exit code and the end of the log |
+| `colab job status JOB [--lines N]` / `job list` / `job stop JOB` | State (`running`, `succeeded`, `failed`, `stopped`, `killed`, `lost`), memory, exit code and the end of the log |
 | `colab stop [--slot S \| --endpoint E \| --all]` | Stop runtimes |
 | `colab ls [PATH]` | List files on the runtime (default `content`) |
 | `colab download REMOTE [--out PATH] [--force]` | Stream a runtime file to disk |
@@ -55,6 +55,8 @@ After a timeout the code keeps running and the kernel stays busy. The next run i
 ### Background jobs
 
 `colab job start -f train.py --gpu T4` starts the script as a detached process. It logs to `content/.colab-cli/jobs/JOB/log` and records the exit code when it ends. `job status` and `job list` read these files directly, so they work even while the kernel is busy. `job stop` ends the job's whole process group. Jobs survive `colab restart`, but not `colab stop`.
+
+A small supervisor runs each job. Every 5 seconds it records the job's memory (all its processes) and the runtime's available memory, honoring container limits. `job status` and `job wait` report `memory` (`peak_job_mb`, `min_available_mb`, `total_mb`, and current use while running); the full history is in `memory.jsonl` (`memory_log`). A job ended by SIGKILL is `killed`. If memory was nearly exhausted just before, `likely_cause` is `out_of_memory`, with a `next_step`. A job whose supervisor stops reporting for 2 minutes without recording an end is `lost`. The supervisor asks the out-of-memory killer to spare itself, so an out-of-memory end is still recorded.
 
 ### Idle auto-stop
 
