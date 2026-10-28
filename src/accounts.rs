@@ -28,6 +28,35 @@ pub fn list(current: &str) -> Value {
     })
 }
 
+/// A sign-in result, noting when it replaced another Google account in this
+/// profile or duplicates a Google account signed in under another profile.
+pub fn signed_in(account: &str, before: Option<String>, mut result: Value) -> Value {
+    result["account"] = account.into();
+    let email = result["email"].as_str().unwrap_or_default().to_owned();
+    let mut notes = Vec::new();
+    if let Some(before) = before.filter(|b| !b.is_empty() && *b != email) {
+        notes.push(format!(
+            "This replaced {before} in profile {account}. To keep both, sign in under another name: `colab --account NAME auth login`."
+        ));
+        result["replaced"] = before.into();
+    }
+    let same: Vec<String> = config::accounts()
+        .into_iter()
+        .filter(|other| other != account && auth(other).email().as_deref() == Some(email.as_str()))
+        .collect();
+    if !same.is_empty() {
+        notes.push(format!(
+            "{email} is also signed in as profile {}; both profiles use the same Google account.",
+            same.join(", ")
+        ));
+        result["also_profiles"] = same.into();
+    }
+    if !notes.is_empty() {
+        result["note"] = notes.join(" ").into();
+    }
+    result
+}
+
 /// Make `name` the default account. It must be signed in, so a typo cannot
 /// silently send later commands to an empty profile.
 pub fn use_account(name: &str) -> Result<Value> {
@@ -57,4 +86,20 @@ pub fn api(name: &str) -> Result<google::Api> {
         ));
     }
     Ok(google::Api::new(home))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replaced_google_account_is_reported() {
+        let first = signed_in("t-new", None, json!({"email": "a@x.com"}));
+        assert!(first.get("replaced").is_none() && first.get("note").is_none());
+        let again = signed_in("t-new", Some("a@x.com".into()), json!({"email": "a@x.com"}));
+        assert!(again.get("replaced").is_none());
+        let other = signed_in("t-new", Some("a@x.com".into()), json!({"email": "b@x.com"}));
+        assert_eq!(other["replaced"], "a@x.com");
+        assert!(other["note"].as_str().unwrap().contains("--account NAME"));
+    }
 }

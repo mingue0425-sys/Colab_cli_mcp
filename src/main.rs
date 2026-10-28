@@ -408,11 +408,15 @@ async fn dispatch(command: Command) -> Result<Value> {
             .await?
         }
         Command::Auth(AuthCommand::Login { client, no_browser }) => {
-            let mut result = api.auth.login(client.as_deref(), !no_browser).await?;
-            result["account"] = app.account.clone().into();
-            result
+            let before = api.auth.email();
+            let result = api.auth.login(client.as_deref(), !no_browser).await?;
+            accounts::signed_in(&app.account, before, result)
         }
-        Command::Auth(AuthCommand::Import { file }) => api.auth.import(&file).await?,
+        Command::Auth(AuthCommand::Import { file }) => {
+            let before = api.auth.email();
+            let result = api.auth.import(&file).await?;
+            accounts::signed_in(&app.account, before, result)
+        }
         Command::Auth(AuthCommand::Status) => {
             let mut status = api.auth.status()?;
             status["account"] = app.account.clone().into();
