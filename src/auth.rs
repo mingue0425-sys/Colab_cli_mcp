@@ -126,7 +126,7 @@ impl Auth {
             return Err(Error::new(
                 "auth_required",
                 "Google rejected the saved sign-in (it may have been revoked or expired).",
-                "Run `colab auth login` again.",
+                "Run `colab auth login` again (add --account NAME for another profile). If this happens about every 7 days, the OAuth client's consent screen is in Testing, where Google expires sign-ins after 7 days: publish the app (Google Auth Platform > Audience > Publish app) to keep sign-ins.",
             ));
         }
         if !response.status().is_success() {
