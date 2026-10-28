@@ -11,8 +11,8 @@ name = "colab"
 path = "src/main.rs"
 
 [dependencies]
-async-tungstenite = { version = "0.32.1", default-features = false, features = ["tokio-runtime"] }
-base64 = "0.22.1"
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["tokio-runtime"] }
+base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = "0.3.34"

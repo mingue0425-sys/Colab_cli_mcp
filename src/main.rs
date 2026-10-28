@@ -12,6 +12,8 @@ mod mcp;
 mod ops;
 mod reaper;
 mod runtime;
+#[cfg(test)]
+mod testkit;
 
 use clap::{Args, Parser, Subcommand};
 use error::{Error, Result};

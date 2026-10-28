@@ -886,6 +886,10 @@ impl Outputs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn long_streams_keep_their_end_and_images_are_summarized() {
@@ -936,6 +940,126 @@ mod tests {
                 .unwrap()
                 .contains("still running")
         );
+    }
+
+    /// A fake Jupyter server: sessions list one kernel ("live"), any other
+    /// kernel's channel is gone, and each execute_request prints its code.
+    async fn jupyter() -> (String, Arc<AtomicUsize>) {
+        let channels = Arc::new(AtomicUsize::new(0));
+        let counter = channels.clone();
+        let base = crate::testkit::serve(move |request, mut stream| {
+            let counter = counter.clone();
+            async move {
+            use crate::testkit::respond;
+            assert_eq!(request.header(TOKEN_HEADER), Some("proxy-token"));
+            assert!(request.header("authorization").is_none());
+            if request.path == "/api/sessions" {
+                let body = json!([{"path": SESSION_PATH, "kernel": {"name": "python3", "id": "live"}}]);
+                return respond(stream, 200, &[], &body.to_string()).await;
+            }
+            if !request.path.starts_with("/api/kernels/live/channels?session_id=") {
+                return respond(stream, 404, &[], "").await;
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let accept = derive_accept_key(request.header("sec-websocket-key").unwrap().as_bytes());
+            let head = format!("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n");
+            stream.write_all(head.as_bytes()).await.unwrap();
+            let mut socket =
+                WebSocketStream::from_raw_socket(TokioAdapter::new(stream), Role::Server, None)
+                    .await;
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: Value = serde_json::from_str(text.as_str()).unwrap();
+                let parent = request["header"].clone();
+                let code = request["content"]["code"].as_str().unwrap().to_owned();
+                if code == "sleep" {
+                    continue;
+                }
+                for (kind, content) in [
+                    ("stream", json!({"name": "stdout", "text": format!("{code}\n")})),
+                    ("execute_reply", json!({"status": "ok", "execution_count": 1})),
+                    ("status", json!({"execution_state": "idle"})),
+                ] {
+                    let reply = json!({"header": {"msg_type": kind}, "parent_header": parent, "content": content});
+                    socket.send(Message::Text(reply.to_string().into())).await.unwrap();
+                }
+            }
+            }
+        })
+        .await;
+        (base, channels)
+    }
+
+    fn lease(url: String, kernel_id: Option<&str>) -> Lease {
+        // SAFETY: tests only add this variable; nothing removes or reads it concurrently in a racy way.
+        unsafe { std::env::set_var("COLAB_CLI_ALLOW_LOOPBACK", "1") };
+        Lease {
+            endpoint: "fixture".into(),
+            url,
+            token: "proxy-token".into(),
+            accelerator: "NONE".into(),
+            expires_at: i64::MAX,
+            slot: None,
+            kernel_id: kernel_id.map(str::to_owned),
+            cached: false,
+            confirmed: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn executes_over_websocket_and_reuses_the_channel() {
+        let (base, channels) = jupyter().await;
+        let lease = lease(base, None);
+        let home = std::env::temp_dir().join(format!("colab-cli-test-{}", uuid::Uuid::new_v4()));
+        let api = Api::new(home);
+        let kernel = Kernel::connect(&lease).unwrap();
+        let wait = Duration::from_secs(5);
+        let (first, id) = kernel
+            .execute(&api, &lease, "one", wait, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            (first["status"].as_str(), first["text"].as_str()),
+            (Some("ok"), Some("one\n"))
+        );
+        assert_eq!(id, "live");
+        let (second, _) = kernel
+            .execute(&api, &lease, "two", wait, false)
+            .await
+            .unwrap();
+        assert_eq!(second["text"], "two\n");
+        assert_eq!(channels.load(Ordering::SeqCst), 1);
+        let (late, _) = kernel
+            .execute(&api, &lease, "sleep", Duration::from_millis(200), false)
+            .await
+            .unwrap();
+        assert_eq!(late["status"], "timeout");
+        kernel.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_gone_kernel_falls_back_to_the_session_lookup() {
+        let lease = lease(jupyter().await.0, Some("gone"));
+        let api = Api::new(std::env::temp_dir().join("colab-cli-test-unused"));
+        let kernel = Kernel::connect(&lease).unwrap();
+        let (result, id) = kernel
+            .execute(&api, &lease, "hi", Duration::from_secs(5), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            (result["text"].as_str(), id.as_str()),
+            (Some("hi\n"), "live")
+        );
+    }
+
+    #[test]
+    fn plain_http_needs_loopback() {
+        let mut remote = lease("http://example.com/".into(), None);
+        assert_eq!(
+            Kernel::connect(&remote).err().unwrap().code,
+            "unsafe_runtime"
+        );
+        remote.url = "https://example.com/proxy".into();
+        assert!(Kernel::connect(&remote).is_ok());
     }
 
     #[test]
