@@ -8,7 +8,10 @@ use crate::{
 };
 use rmcp::{RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
 use serde_json::{Map, Value, json};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+/// How often a long call reports progress to clients that asked for it.
+const HEARTBEAT: Duration = Duration::from_secs(10);
 
 const INSTRUCTIONS: &str = "Google Colab tools. colab_run executes Python like a notebook cell on a runtime \
 (CPU by default; gpu: \"T4\" or tpu: \"V5E1\"; check colab_usage for eligible hardware). Runs with the same slot share \
@@ -617,10 +620,16 @@ impl ServerHandler for Server {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
+        let progress = request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get_progress_token())
+            .or_else(|| context.meta.get_progress_token());
         let args = Args(request.arguments.unwrap_or_default());
         let result = tokio::select! {
             _ = context.ct.cancelled() => Err(Error::new("cancelled", "The call was cancelled.", "Check runtime state before repeating side effects.")),
             result = self.invoke(&request.name, args) => result,
+            () = heartbeat(&context.peer, progress) => unreachable!(),
         };
         Ok(match result {
             Ok(value) => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
@@ -629,6 +638,23 @@ impl ServerHandler for Server {
             }
         }
         .into())
+    }
+}
+
+/// While a call runs, tell a client that asked for progress that it is still
+/// working, so client timeouts that reset on progress do not end long runs.
+async fn heartbeat(peer: &rmcp::Peer<RoleServer>, token: Option<ProgressToken>) {
+    let Some(token) = token else {
+        return std::future::pending().await;
+    };
+    let started = tokio::time::Instant::now();
+    let mut ticks = tokio::time::interval_at(started + HEARTBEAT, HEARTBEAT);
+    loop {
+        ticks.tick().await;
+        let seconds = started.elapsed().as_secs();
+        let update = ProgressNotificationParam::new(token.clone(), seconds as f64)
+            .with_message(format!("Still running after {seconds} s."));
+        let _ = peer.notify_progress(update).await;
     }
 }
 
