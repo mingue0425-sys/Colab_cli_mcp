@@ -12,7 +12,7 @@ colab stop
 ## Setup
 
 1. In [Google Cloud Console](https://console.cloud.google.com/), enable the **Google Drive API**. Create an **OAuth client ID** of type **Desktop app** and download its JSON. While the consent screen is in testing, add your account as a test user.
-2. Build: `cargo build --release` (the binary is `target/release/colab`).
+2. Build: `cargo build --release` (the binary is `target/release/colab`). To keep the Rust toolchain and crates inside this folder instead, run `scripts/bootstrap.sh` once, then `scripts/install-local.sh` (launcher in `.local/bin`).
 3. Sign in once: `colab auth login --client client_secret_XXX.json`. A browser opens, and the sign-in arrives on a loopback address. `colab auth import FILE` accepts an existing grant JSON instead.
 
 State lives in `$COLAB_CLI_HOME` (default `~/.colab-cli`): `token.json` (owner-only), the client, and slot records. Requested scopes: `openid`, `userinfo.email`, `drive`.

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Build offline (toolchain/crates from /Volumes/game/Hycli/.cache) and refresh the
-# local launcher in .local/bin. Data stays in .local/data.
+# Build offline (toolchain/crates in .local; run scripts/bootstrap.sh once) and
+# refresh the local launcher in .local/bin. Data stays in .local/data.
 set -e
 cd "$(dirname "$0")/.."
 . scripts/env.sh

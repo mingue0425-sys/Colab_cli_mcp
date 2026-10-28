@@ -1,4 +1,5 @@
-# Source this to build offline with the toolchain and crate cache kept in /Volumes/game/Hycli/.cache.
-H="${HYCLI_CACHE:-/Volumes/game/Hycli/.cache}"
-export PATH="$H/rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
-export RUSTUP_HOME="$H/rustup" CARGO_HOME="$H/cargo"
+# Source this to build with the toolchain and crate cache kept in this repo's
+# .local (set up once by scripts/bootstrap.sh); nothing is installed elsewhere.
+L="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")/.." && pwd)/.local"
+export RUSTUP_HOME="$L/rustup" CARGO_HOME="$L/cargo-home"
+export PATH="$CARGO_HOME/bin:$PATH"
