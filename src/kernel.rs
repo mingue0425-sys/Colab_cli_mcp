@@ -461,6 +461,21 @@ impl Kernel {
         Ok((busy, latest))
     }
 
+    /// RAM, disk and GPU use from the runtime's resource endpoint (the one
+    /// Colab's own clients use). Works while the kernel is busy.
+    pub async fn resources(&self) -> Result<Value> {
+        let request = self.json(
+            reqwest::Method::GET,
+            self.url("api/colab/resources")?,
+            None,
+            "Runtime resources",
+        );
+        let raw = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .map_err(|_| unavailable("Runtime resources"))??;
+        Ok(summarize_resources(&raw))
+    }
+
     /// `idle`, `busy` or `starting`.
     pub async fn state(&self, kernel_id: &str) -> Result<String> {
         let kernel = self
@@ -645,6 +660,51 @@ impl Kernel {
             .await?;
         }
         Ok(json!({"uploaded": parts.join("/"), "bytes": size}))
+    }
+}
+
+/// Byte counts in megabytes. Accepts numbers or the strings protobuf JSON uses for 64-bit values.
+fn mb(value: &Value) -> Value {
+    let bytes = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()));
+    bytes.map_or(Value::Null, |b| json!((b / 1_048_576.0).round() as i64))
+}
+
+/// The resource endpoint's answer, in megabytes.
+pub fn summarize_resources(raw: &Value) -> Value {
+    let memory = &raw["memory"];
+    let mut out = json!({
+        "ram_total_mb": mb(&memory["totalBytes"]),
+        "ram_free_mb": mb(&memory["freeBytes"]),
+        "disks": raw["disks"].as_array().into_iter().flatten().map(|d| {
+            let fs = &d["filesystem"];
+            json!({"label": fs["label"], "total_mb": mb(&fs["totalBytes"]), "used_mb": mb(&fs["usedBytes"])})
+        }).collect::<Vec<_>>(),
+    });
+    let gpus: Vec<Value> = raw["gpus"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|g| {
+            json!({"name": g["name"], "memory_used_mb": mb(&g["memoryUsedBytes"]),
+                   "memory_total_mb": mb(&g["memoryTotalBytes"]), "utilization": g["gpuUtilization"]})
+        })
+        .collect();
+    if !gpus.is_empty() {
+        out["gpus"] = gpus.into();
+    }
+    out
+}
+
+/// Under a tenth of the RAM free: the next allocation may get processes killed.
+pub fn low_memory(resources: &Value) -> bool {
+    match (
+        resources["ram_free_mb"].as_f64(),
+        resources["ram_total_mb"].as_f64(),
+    ) {
+        (Some(free), Some(total)) => total > 0.0 && free < total * 0.1,
+        _ => false,
     }
 }
 
@@ -1062,6 +1122,25 @@ mod tests {
         );
         remote.url = "https://example.com/proxy".into();
         assert!(Kernel::connect(&remote).is_ok());
+    }
+
+    #[test]
+    fn resources_are_summarized_in_megabytes() {
+        let raw = json!({
+            "memory": {"totalBytes": 13_958_643_712u64, "freeBytes": "943718400"},
+            "disks": [{"filesystem": {"label": "kernel", "totalBytes": 120_259_084_288u64, "usedBytes": 40_000_000_000u64}}],
+            "gpus": [{"name": "Tesla T4", "memoryUsedBytes": 1_073_741_824, "memoryTotalBytes": 16_106_127_360u64, "gpuUtilization": 0.5}],
+        });
+        let summary = summarize_resources(&raw);
+        assert_eq!(summary["ram_total_mb"], 13312);
+        assert_eq!(summary["ram_free_mb"], 900);
+        assert_eq!(summary["disks"][0]["total_mb"], 114688);
+        assert_eq!(summary["gpus"][0]["memory_used_mb"], 1024);
+        assert!(low_memory(&summary));
+        let cpu = summarize_resources(
+            &json!({"memory": {"totalBytes": 100, "freeBytes": 50}, "disks": []}),
+        );
+        assert!(cpu.get("gpus").is_none() && !low_memory(&cpu));
     }
 
     #[test]

@@ -360,10 +360,18 @@ pub async fn usage(api: &Api) -> Result<Value> {
 pub async fn status(api: &Api, home: &Path) -> Result<Value> {
     let slots = load_slots(home);
     let idle_stop = idle_stop_minutes(home) as i64;
-    let runtimes: Vec<Value> = assignments(api)
-        .await?
+    let listed = assignments(api).await?;
+    // Resource use per runtime, fetched in parallel; a runtime that does not
+    // answer simply has none.
+    let resources = futures_util::future::join_all(listed.iter().map(|a| async move {
+        let kernel = crate::kernel::Kernel::connect(&lease_for(a)?).ok()?;
+        kernel.resources().await.ok()
+    }))
+    .await;
+    let runtimes: Vec<Value> = listed
         .iter()
-        .map(|a| {
+        .zip(resources)
+        .map(|(a, resources)| {
             let endpoint = a["endpoint"].as_str().unwrap_or_default();
             json!({
                 "endpoint": endpoint,
@@ -372,6 +380,7 @@ pub async fn status(api: &Api, home: &Path) -> Result<Value> {
                 "variant": match a["variant"].as_i64() { Some(1) => "GPU", Some(2) => "TPU", _ => "DEFAULT" },
                 "high_ram": a["machineShape"].as_i64() == Some(1),
                 "idle_minutes": slots.values().find(|r| r.endpoint == endpoint && r.last_used > 0).map(|r| (now() - r.last_used) / 60),
+                "resources": resources,
             })
         })
         .collect();

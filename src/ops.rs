@@ -567,6 +567,12 @@ impl App {
             let cut = total.is_some_and(|total| total > log.len() as u64);
             let stats = job_stats(&kernel, &dir).await;
             let mut status = jobs::describe(exit_code, stats.as_ref(), now());
+            if let Ok(resources) = kernel.resources().await {
+                if status["state"] == "running" && kernel::low_memory(&resources) {
+                    status["warning"] = "The runtime has under 10% of its RAM free; the job (or the kernel) may soon be killed for lack of memory. Consider stopping parallel work.".into();
+                }
+                status["runtime_resources"] = resources;
+            }
             status["job"] = id.into();
             status["log_bytes"] = total.into();
             status["log_tail"] = jobs::last_lines(&log, lines, cut).into();
