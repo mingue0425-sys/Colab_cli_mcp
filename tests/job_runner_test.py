@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "job_runner.py")
@@ -65,6 +66,25 @@ class Supervisor(unittest.TestCase):
         # It ran only after the first job ended, although that one failed.
         self.assertEqual((code, log), ("0", "5\n"))
         self.assertNotIn("waiting_for", stats)
+
+    def test_a_queued_job_has_a_log_while_it_waits(self):
+        blocker = tempfile.mkdtemp()
+        with open(os.path.join(blocker, "pid"), "w") as f:
+            f.write(str(os.getpid()))  # Alive until we write its exit code.
+        job = tempfile.mkdtemp()
+        with open(os.path.join(job, "main.py"), "w") as f:
+            f.write("print('late')")
+        env = dict(os.environ, COLAB_CLI_JOB_EVERY="0.2")
+        runner = subprocess.Popen([sys.executable, RUNNER, job, "python", blocker], env=env)
+        try:
+            time.sleep(1)
+            self.assertTrue(os.path.exists(os.path.join(job, "log")))
+            with open(os.path.join(job, "stats.json")) as f:
+                self.assertEqual(json.load(f)["waiting_for"], os.path.basename(blocker))
+        finally:
+            with open(os.path.join(blocker, "exit_code"), "w") as f:
+                f.write("0")
+            runner.wait(timeout=30)
 
     def test_after_a_vanished_job_starts_anyway(self):
         gone = tempfile.mkdtemp()

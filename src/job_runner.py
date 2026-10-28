@@ -116,6 +116,8 @@ def main(job_dir, kind, after=None):
     script = os.path.join(job_dir, "main.py" if kind == "python" else "main.sh")
     argv = [sys.executable, "-u", script] if kind == "python" else ["bash", script]
     stats_path = os.path.join(job_dir, "stats.json")
+    # The log exists from the start, so a queued job can be looked up.
+    open(os.path.join(job_dir, "log"), "ab").close()
     # Queued behind another job: wait for it to end, whatever its outcome.
     while after and not ended(after):
         write_json(stats_path, {"waiting_for": os.path.basename(after), "updated_at": time.time()})
