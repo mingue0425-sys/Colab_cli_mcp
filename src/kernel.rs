@@ -824,7 +824,9 @@ impl Outputs {
                 self.truncated |= cut;
             }
         }
-        let ansi = regex::Regex::new("\x1b\\[[0-9;]*[A-Za-z]").expect("valid pattern");
+        static ANSI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new("\x1b\\[[0-9;]*[A-Za-z]").expect("valid pattern")
+        });
         let mut text = String::new();
         for output in &self.items {
             match output["output_type"].as_str() {
@@ -837,7 +839,7 @@ impl Outputs {
                 }
                 Some("error") => {
                     for line in output["traceback"].as_array().into_iter().flatten() {
-                        text.push_str(&ansi.replace_all(line.as_str().unwrap_or_default(), ""));
+                        text.push_str(&ANSI.replace_all(line.as_str().unwrap_or_default(), ""));
                         text.push('\n');
                     }
                 }
