@@ -135,7 +135,7 @@ enum Command {
         #[command(flatten)]
         target: Target,
     },
-    /// Download a file from the runtime, e.g. content/out/model.pt.
+    /// Download a file or folder from the runtime, e.g. content/out/model.pt.
     Download {
         remote: String,
         /// Local destination (default: the file's name in the current directory).
@@ -147,7 +147,7 @@ enum Command {
         #[command(flatten)]
         target: Target,
     },
-    /// Upload a local file to the runtime (default destination: content/<name>).
+    /// Upload a local file or folder to the runtime (default destination: content/<name>).
     Upload {
         local: PathBuf,
         remote: Option<String>,
@@ -160,7 +160,7 @@ enum Command {
     /// Colab notebooks in Google Drive.
     #[command(subcommand)]
     Notebook(NotebookCommand),
-    /// Copy a runtime file straight into Google Drive (no Drive mount or approval).
+    /// Copy a runtime file or folder straight into Google Drive (no Drive mount or approval).
     SaveToDrive {
         remote: String,
         /// Destination folder path under My Drive, created if missing.

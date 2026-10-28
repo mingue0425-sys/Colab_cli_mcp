@@ -206,7 +206,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "colab_download",
-            "Download a file from a running runtime to this computer. Returns the saved local path.",
+            "Download a file or a whole folder (up to 5000 files) from a running runtime to this computer. Returns the saved local path.",
             schema(
                 merge(
                     target(),
@@ -222,7 +222,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "colab_upload",
-            "Upload a local file to a running runtime.",
+            "Upload a local file or folder (up to 5000 files) to a running runtime.",
             schema(
                 merge(
                     target(),
@@ -283,7 +283,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "colab_save_to_drive",
-            "Copy a file from the runtime straight into Google Drive. Needs no Drive mount and no browser approval; prefer it for keeping results.",
+            "Copy a file, or a folder with its subfolders, from the runtime straight into Google Drive. Needs no Drive mount and no browser approval; prefer it for keeping results.",
             schema(
                 merge(
                     target(),

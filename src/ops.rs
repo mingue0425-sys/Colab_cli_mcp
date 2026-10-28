@@ -94,6 +94,121 @@ fn now() -> f64 {
     chrono::Utc::now().timestamp_millis() as f64 / 1000.0
 }
 
+/// Stream one runtime file into Drive.
+async fn save_file(
+    kernel: &Kernel,
+    drive_api: &Api,
+    remote: &str,
+    name: &str,
+    parent: Option<&str>,
+) -> Result<Value> {
+    let response = kernel.open_file(remote).await?;
+    let size = response.content_length().ok_or_else(|| {
+        Error::new(
+            "unsupported_file",
+            "The runtime did not report the file size.",
+            "Download it with `colab download`, then `colab drive upload`.",
+        )
+    })?;
+    let mime = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        // The runtime guesses types from extensions (".pt" becomes a
+        // game-console format); pass only common ones, else Drive decides.
+        .filter(|v| {
+            ["text/", "image/", "audio/", "video/"]
+                .iter()
+                .any(|p| v.starts_with(p))
+                || [
+                    "application/json",
+                    "application/pdf",
+                    "application/zip",
+                    "application/gzip",
+                ]
+                .contains(v)
+        })
+        .map(str::to_owned);
+    let body = reqwest::Body::wrap_stream(response.bytes_stream());
+    drive::upload_body(drive_api, name, parent, mime.as_deref(), size, body).await
+}
+
+/// Save a runtime folder into a Drive folder named `name` (under `parent`, or
+/// My Drive), recreating its subfolders.
+async fn save_tree(
+    kernel: &Kernel,
+    drive_api: &Api,
+    remote: &str,
+    name: &str,
+    parent: Option<&str>,
+) -> Result<Value> {
+    let files = kernel.walk(remote).await?;
+    let base = parent.unwrap_or("root");
+    let top = drive::ensure_folder_in(drive_api, base, name).await?["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let mut folders = HashMap::from([(String::new(), top.clone())]);
+    let mut bytes = 0u64;
+    for rel in &files {
+        let (dir, file) = rel.rsplit_once('/').unwrap_or(("", rel.as_str()));
+        let folder = match folders.get(dir) {
+            Some(id) => id.clone(),
+            None => {
+                let id = drive::ensure_folder_in(drive_api, &top, dir).await?["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                folders.insert(dir.to_owned(), id.clone());
+                id
+            }
+        };
+        let saved = save_file(
+            kernel,
+            drive_api,
+            &format!("{remote}/{rel}"),
+            file,
+            Some(&folder),
+        )
+        .await?;
+        bytes += saved["size"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .or(saved["size"].as_u64())
+            .unwrap_or(0);
+    }
+    Ok(json!({"folder_id": top, "name": name, "files": files.len(), "bytes": bytes}))
+}
+
+/// Every file under a local directory (symlinks skipped), relative to it.
+fn local_tree(root: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let rel = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|_| Error::input("Bad local path."))?
+                    .to_string_lossy()
+                    .into_owned();
+                files.push(rel);
+            }
+        }
+        if files.len() > kernel::MAX_TREE_FILES {
+            return Err(kernel::too_many_files());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 fn kernel_busy() -> Error {
     Error::new(
         "kernel_busy",
@@ -388,9 +503,26 @@ impl App {
         let parts = kernel::remote_parts(remote)?;
         let default = self.default_out(parts.last().map(String::as_str).unwrap_or("download.bin"));
         let out = out.map(Path::to_path_buf).unwrap_or(default);
-        on_runtime!(self, slot, endpoint, |kernel, _lease| kernel
-            .download(remote, &out, force)
-            .await)
+        on_runtime!(self, slot, endpoint, |kernel, _lease| {
+            if !kernel.is_dir(remote).await? {
+                return kernel.download(remote, &out, force).await;
+            }
+            if out.is_file() {
+                return Err(Error::input(format!(
+                    "{} is a file; a folder needs a folder destination.",
+                    out.display()
+                )));
+            }
+            let files = kernel.walk(remote).await?;
+            let mut bytes = 0;
+            for rel in &files {
+                let saved = kernel
+                    .download(&format!("{remote}/{rel}"), &out.join(rel), force)
+                    .await?;
+                bytes += saved["bytes"].as_u64().unwrap_or(0);
+            }
+            Ok(json!({"saved": out, "files": files.len(), "bytes": bytes, "source": remote}))
+        })
     }
 
     pub async fn upload(
@@ -400,12 +532,33 @@ impl App {
         slot: Option<&str>,
         endpoint: Option<&str>,
     ) -> Result<Value> {
-        on_runtime!(self, slot, endpoint, |kernel, _lease| kernel
-            .upload(local, remote)
-            .await)
+        if !local.is_dir() {
+            return on_runtime!(self, slot, endpoint, |kernel, _lease| kernel
+                .upload(local, remote)
+                .await);
+        }
+        let files = local_tree(local)?;
+        on_runtime!(self, slot, endpoint, |kernel, _lease| {
+            kernel.mkdirs(remote).await?;
+            let mut made = std::collections::HashSet::new();
+            let mut bytes = 0;
+            for rel in &files {
+                if let Some((dir, _)) = rel.rsplit_once('/')
+                    && made.insert(dir.to_owned())
+                {
+                    kernel.mkdirs(&format!("{remote}/{dir}")).await?;
+                }
+                let sent = kernel
+                    .upload(&local.join(rel), &format!("{remote}/{rel}"))
+                    .await?;
+                bytes += sent["bytes"].as_u64().unwrap_or(0);
+            }
+            Ok(json!({"uploaded": remote, "files": files.len(), "bytes": bytes}))
+        })
     }
 
-    /// Copy a runtime file straight into Drive (no Drive mount or approval needed).
+    /// Copy a runtime file, or a folder with its layout, straight into Drive
+    /// (no Drive mount or approval needed).
     pub async fn save_to_drive(
         &self,
         remote: &str,
@@ -426,50 +579,17 @@ impl App {
         let drive_api = other.as_ref().unwrap_or(&self.api);
         let parent = drive::destination(drive_api, to.parent, to.folder).await?;
         on_runtime!(self, slot, endpoint, |kernel, _lease| {
-            let response = kernel.open_file(remote).await?;
-            let size = response.content_length().ok_or_else(|| {
-                Error::new(
-                    "unsupported_file",
-                    "The runtime did not report the file size.",
-                    "Download it with `colab download`, then `colab drive upload`.",
-                )
-            })?;
-            let mime = response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.split(';').next())
-                // The runtime guesses types from extensions (".pt" becomes a
-                // game-console format); pass only common ones, else Drive decides.
-                .filter(|v| {
-                    ["text/", "image/", "audio/", "video/"]
-                        .iter()
-                        .any(|p| v.starts_with(p))
-                        || [
-                            "application/json",
-                            "application/pdf",
-                            "application/zip",
-                            "application/gzip",
-                        ]
-                        .contains(v)
-                })
-                .map(str::to_owned);
-            let body = reqwest::Body::wrap_stream(response.bytes_stream());
-            let mut uploaded = drive::upload_body(
-                drive_api,
-                &name,
-                parent.as_deref(),
-                mime.as_deref(),
-                size,
-                body,
-            )
-            .await?;
-            uploaded["source"] = remote.into();
+            let mut saved = if kernel.is_dir(remote).await? {
+                save_tree(&kernel, drive_api, remote, &name, parent.as_deref()).await?
+            } else {
+                save_file(&kernel, drive_api, remote, &name, parent.as_deref()).await?
+            };
+            saved["source"] = remote.into();
             if let Some(account) = to.account.filter(|_| other.is_some()) {
-                uploaded["drive_account"] = account.into();
-                uploaded["drive_email"] = drive_api.auth.email().into();
+                saved["drive_account"] = account.into();
+                saved["drive_email"] = drive_api.auth.email().into();
             }
-            Ok(uploaded)
+            Ok(saved)
         })
     }
 

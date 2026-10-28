@@ -126,13 +126,18 @@ pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
 /// Find or create a folder path such as `results/run-1` under My Drive.
 pub async fn ensure_folder(api_: &Api, path: &str) -> Result<Value> {
+    ensure_folder_in(api_, "root", path).await
+}
+
+/// Find or create a folder path under the folder `start` (an ID or "root").
+pub async fn ensure_folder_in(api_: &Api, start: &str, path: &str) -> Result<Value> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     if parts.is_empty() || parts.len() > 20 || parts.iter().any(|p| p.len() > 255) {
         return Err(Error::input(
             "Folder paths look like results or results/run-1.",
         ));
     }
-    let mut parent = "root".to_owned();
+    let mut parent = start.to_owned();
     let mut created = false;
     for name in parts {
         let query = format!(

@@ -8,6 +8,7 @@ use tokio::{
 };
 
 pub struct Request {
+    pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
 }
@@ -52,7 +53,8 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let head = String::from_utf8(head).ok()?;
     let mut lines = head.split("\r\n");
     let mut first = lines.next()?.split(' ');
-    let path = first.nth(1)?.to_owned();
+    let method = first.next()?.to_owned();
+    let path = first.next()?.to_owned();
     let headers: Vec<(String, String)> = lines
         .filter_map(|line| line.split_once(':'))
         .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
@@ -64,7 +66,11 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         .unwrap_or(0);
     let mut body = vec![0; length];
     stream.read_exact(&mut body).await.ok()?;
-    Some(Request { path, headers })
+    Some(Request {
+        method,
+        path,
+        headers,
+    })
 }
 
 /// Write a complete response and close the connection.

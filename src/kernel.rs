@@ -57,6 +57,17 @@ struct Channel {
     last_used: Instant,
 }
 
+/// Folder transfers stop above this many files; archive larger trees first.
+pub const MAX_TREE_FILES: usize = 5000;
+
+pub fn too_many_files() -> Error {
+    Error::new(
+        "too_many_files",
+        format!("The folder has more than {MAX_TREE_FILES} files."),
+        "Archive it first (for example `tar czf out.tgz DIR` in a run or job), then transfer the archive.",
+    )
+}
+
 fn kernel_gone() -> Error {
     Error::new(
         "kernel_gone",
@@ -590,6 +601,63 @@ impl Kernel {
         Ok(json!({"path": listing["path"], "entries": entries}))
     }
 
+    /// Whether a runtime path is a directory (without fetching any content).
+    pub async fn is_dir(&self, path: &str) -> Result<bool> {
+        let mut url = self.file_url("api/contents/", &remote_parts(path)?)?;
+        url.query_pairs_mut().append_pair("content", "0");
+        let model = self
+            .json(reqwest::Method::GET, url, None, "Runtime path")
+            .await?;
+        Ok(model["type"] == "directory")
+    }
+
+    /// Every file under a runtime directory, as paths relative to it.
+    pub async fn walk(&self, root: &str) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        let mut pending = vec![String::new()];
+        while let Some(dir) = pending.pop() {
+            let path = if dir.is_empty() {
+                root.to_owned()
+            } else {
+                format!("{root}/{dir}")
+            };
+            let listing = self.list(&path).await?;
+            for entry in listing["entries"].as_array().into_iter().flatten() {
+                let name = entry["name"].as_str().unwrap_or_default();
+                let rel = if dir.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{dir}/{name}")
+                };
+                match entry["type"].as_str() {
+                    Some("directory") => pending.push(rel),
+                    _ => files.push(rel),
+                }
+            }
+            if files.len() > MAX_TREE_FILES {
+                return Err(too_many_files());
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    /// Create a runtime directory and its parents (existing ones are kept).
+    pub async fn mkdirs(&self, path: &str) -> Result<()> {
+        let parts = remote_parts(path)?;
+        for depth in 1..=parts.len() {
+            let url = self.file_url("api/contents/", &parts[..depth])?;
+            self.json(
+                reqwest::Method::PUT,
+                url,
+                Some(json!({"type": "directory"})),
+                "Runtime folder",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Stream a runtime file to a local path (no size limit, no buffering).
     /// A runtime file as a streaming response.
     pub async fn open_file(&self, path: &str) -> Result<reqwest::Response> {
@@ -1110,6 +1178,55 @@ mod tests {
         assert_eq!(
             (result["text"].as_str(), id.as_str()),
             (Some("hi\n"), "live")
+        );
+    }
+
+    #[tokio::test]
+    async fn folders_are_walked_and_created() {
+        let made = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = made.clone();
+        let base = crate::testkit::serve(move |request, stream| {
+            let log = log.clone();
+            async move {
+                use crate::testkit::respond;
+                let (path, query) = request.path.split_once('?').unwrap_or((&request.path, ""));
+                let listing =
+                    |entries: Value| json!({"type": "directory", "content": entries}).to_string();
+                let body = match (request.method.as_str(), path, query) {
+                    ("PUT", path, _) => {
+                        log.lock().unwrap().push(path.to_owned());
+                        "{}".to_owned()
+                    }
+                    (_, "/api/contents/content/out", "content=0") => listing(Value::Null),
+                    (_, "/api/contents/content/out/a.txt", "content=0") => {
+                        json!({"type": "file"}).to_string()
+                    }
+                    (_, "/api/contents/content/out", _) => listing(json!([
+                        {"name": "a.txt", "type": "file"}, {"name": "sub", "type": "directory"}])),
+                    (_, "/api/contents/content/out/sub", _) => {
+                        listing(json!([{"name": "b.bin", "type": "file"}]))
+                    }
+                    _ => return respond(stream, 404, &[], "").await,
+                };
+                respond(stream, 200, &[], &body).await;
+            }
+        })
+        .await;
+        let kernel = Kernel::connect(&lease(base, None)).unwrap();
+        assert!(kernel.is_dir("content/out").await.unwrap());
+        assert!(!kernel.is_dir("content/out/a.txt").await.unwrap());
+        assert_eq!(
+            kernel.walk("content/out").await.unwrap(),
+            ["a.txt", "sub/b.bin"]
+        );
+        kernel.mkdirs("content/new/deep").await.unwrap();
+        assert_eq!(
+            *made.lock().unwrap(),
+            [
+                "/api/contents/content",
+                "/api/contents/content/new",
+                "/api/contents/content/new/deep"
+            ]
         );
     }
 
