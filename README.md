@@ -32,15 +32,32 @@ State lives in `$COLAB_CLI_HOME` (default `~/.colab-cli`): `token.json` (owner-o
 | `colab ls [PATH]` | List files on the runtime (default `content`) |
 | `colab download REMOTE [--out PATH] [--force]` | Stream a runtime file to disk |
 | `colab upload LOCAL [REMOTE]` | Upload a file to the runtime (chunked; default `content/<name>`) |
-| `colab save-to-drive REMOTE [--folder PATH]` | Copy a runtime file straight into Drive (no mount, no approval; folders are created) |
+| `colab save-to-drive REMOTE [--folder PATH] [--drive-account NAME]` | Copy a runtime file straight into Drive (no mount, no approval; folders are created), optionally another account's Drive |
 | `colab drive search QUERY` / `download ID` / `upload LOCAL [--folder PATH]` / `mkdir PATH` | Drive files (resumable upload, original names kept) |
 | `colab idle-stop [MINUTES]` | Show or set the idle auto-stop (default 30, 0 disables) |
 | `colab notebook list` / `read ID` / `create NAME` / `copy ID NAME` / `rename ID NAME` | Colab notebooks |
 | `colab notebook run ID [--save] [--continue-on-error]` | Run a notebook's code cells; `--save` writes the outputs back |
 | `colab auth login` / `import` / `status` / `logout` | Google sign-in |
+| `colab auth list` / `auth use NAME` / `--account NAME` | Account profiles |
 | `colab mcp` | All of the above as MCP tools over stdio |
 
 Exit codes: 0 success, 1 error (including a Python exception in `run`), 2 bad input, 3 sign-in required, 124 `run` timeout. Errors print `{"error": {"code", "message", "next_step"}}`.
+
+### Accounts
+
+Several Google accounts can be signed in side by side, for example a personal and a work account. Each account profile has its own sign-in, slots, idle auto-stop and watcher. The first account is `default` and keeps its files where they always were; others live in `$COLAB_CLI_HOME/accounts/NAME`.
+
+```sh
+colab --account work auth login          # reuses the default account's OAuth client
+colab auth list                          # accounts, emails, which is in use
+colab auth use work                      # default for later commands (or COLAB_CLI_ACCOUNT, or --account)
+colab --account work run --gpu T4 -f train.py
+colab --account work save-to-drive content/out.pt --folder results --drive-account default
+```
+
+`--drive-account` keeps the runtime on the current account and puts the file in another signed-in account's Drive. For MCP, register one server per account, e.g. `claude mcp add colab-work -- /path/to/colab --account work mcp`; each server tells the agent which account it uses.
+
+Each account works within its own Colab quota. colab-cli never switches or spreads work across accounts by itself. Colab's terms forbid "using multiple accounts to work around access or resource usage restrictions", so do not use profiles to pool free quota.
 
 ### Runtimes and slots
 

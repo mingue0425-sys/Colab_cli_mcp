@@ -292,6 +292,7 @@ pub fn tools() -> Vec<Tool> {
                         "folder": {"type": "string", "description": "Folder path under My Drive, created if missing."},
                         "parent": {"type": "string", "description": "Folder ID instead of a path."},
                         "name": {"type": "string", "description": "Name in Drive; default the file's name."},
+                        "drive_account": {"type": "string", "description": "Save into another signed-in colab-cli account's Drive (see `colab auth list`); only when the user asks for it."},
                     }),
                 ),
                 &["path"],
@@ -542,11 +543,15 @@ impl Server {
             }
             "drive_mkdir" => drive::ensure_folder(api, args.required("path")?).await,
             "colab_save_to_drive" => {
+                let to = crate::ops::DriveTarget {
+                    folder: args.str("folder"),
+                    parent: args.str("parent"),
+                    name: args.str("name"),
+                    account: args.str("drive_account"),
+                };
                 app.save_to_drive(
                     args.required("path")?,
-                    args.str("folder"),
-                    args.str("parent"),
-                    args.str("name"),
+                    &to,
                     args.str("slot"),
                     args.str("endpoint"),
                 )
@@ -606,7 +611,11 @@ impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("colab-cli", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(format!(
+                "{INSTRUCTIONS} This server uses the colab-cli account \"{}\"{}; runtimes, quota and Drive are that account's.",
+                self.app.account,
+                self.app.api.auth.email().map(|e| format!(" ({e})")).unwrap_or_default(),
+            ))
     }
 
     async fn list_tools(

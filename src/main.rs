@@ -1,6 +1,7 @@
 //! colab: run code on Google Colab runtimes and manage Colab notebooks and
 //! Drive files from a terminal or an agent (`colab mcp`).
 
+mod accounts;
 mod auth;
 mod config;
 mod drive;
@@ -33,6 +34,10 @@ struct Cli {
     /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pretty: bool,
+    /// Google account profile to use (see `colab auth list`); default: the one
+    /// chosen with `colab auth use`, else "default". Also COLAB_CLI_ACCOUNT.
+    #[arg(long, global = true, value_name = "NAME")]
+    account: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -167,6 +172,9 @@ enum Command {
         /// Name in Drive (default: the file's name).
         #[arg(long)]
         name: Option<String>,
+        /// Save into another signed-in account's Drive (the runtime stays this account's).
+        #[arg(long, value_name = "NAME")]
+        drive_account: Option<String>,
         #[command(flatten)]
         target: Target,
     },
@@ -242,6 +250,10 @@ enum AuthCommand {
     Import { file: PathBuf },
     /// Show the signed-in account (no secrets).
     Status,
+    /// List account profiles and which one is in use.
+    List,
+    /// Make a signed-in account profile the default for later commands.
+    Use { name: String },
     /// Remove the local sign-in.
     Logout,
 }
@@ -363,13 +375,18 @@ async fn dispatch(command: Command) -> Result<Value> {
             folder,
             parent,
             name,
+            drive_account,
             target,
         } => {
+            let to = ops::DriveTarget {
+                folder: folder.as_deref(),
+                parent: parent.as_deref(),
+                name: name.as_deref(),
+                account: drive_account.as_deref(),
+            };
             app.save_to_drive(
                 &remote,
-                folder.as_deref(),
-                parent.as_deref(),
-                name.as_deref(),
+                &to,
                 target.slot.as_deref(),
                 target.endpoint.as_deref(),
             )
@@ -391,10 +408,18 @@ async fn dispatch(command: Command) -> Result<Value> {
             .await?
         }
         Command::Auth(AuthCommand::Login { client, no_browser }) => {
-            api.auth.login(client.as_deref(), !no_browser).await?
+            let mut result = api.auth.login(client.as_deref(), !no_browser).await?;
+            result["account"] = app.account.clone().into();
+            result
         }
         Command::Auth(AuthCommand::Import { file }) => api.auth.import(&file).await?,
-        Command::Auth(AuthCommand::Status) => api.auth.status()?,
+        Command::Auth(AuthCommand::Status) => {
+            let mut status = api.auth.status()?;
+            status["account"] = app.account.clone().into();
+            status
+        }
+        Command::Auth(AuthCommand::List) => accounts::list(&app.account),
+        Command::Auth(AuthCommand::Use { name }) => accounts::use_account(&name)?,
         Command::Auth(AuthCommand::Logout) => api.auth.logout()?,
         Command::Usage => runtime::usage(api).await?,
         Command::Status => runtime::status(api, &app.home).await?,
@@ -570,6 +595,10 @@ async fn dispatch(command: Command) -> Result<Value> {
 async fn main() {
     let cli = Cli::parse();
     let pretty = cli.pretty;
+    if let Some(Err(error)) = cli.account.as_deref().map(config::select_account) {
+        println!("{}", error.to_json());
+        std::process::exit(error.exit_code());
+    }
     let print = |value: &Value| {
         let text = if pretty {
             serde_json::to_string_pretty(value)

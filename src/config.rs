@@ -1,13 +1,15 @@
 //! Where colab-cli keeps its state, and which service endpoints it talks to.
 //! Endpoints are overridable only so tests can use local fixtures.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
-pub fn home() -> PathBuf {
+/// The state root. The `default` account keeps its files here directly (as
+/// before accounts existed); other accounts live in `accounts/<name>/`.
+pub fn root() -> PathBuf {
     if let Some(dir) = std::env::var_os("COLAB_CLI_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
     }
@@ -15,6 +17,70 @@ pub fn home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_default();
     base.join(".colab-cli")
+}
+
+pub const DEFAULT_ACCOUNT: &str = "default";
+
+/// `--account` for this process, set once by main before anything runs.
+static SELECTED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn select_account(name: &str) -> Result<()> {
+    check_account(name)?;
+    let _ = SELECTED.set(name.to_owned());
+    Ok(())
+}
+
+pub fn check_account(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 32
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return Err(Error::input(
+            "Account names use lowercase letters, digits, '-' or '_' (up to 32), e.g. work.",
+        ));
+    }
+    Ok(())
+}
+
+/// The account in use: `--account`, else `COLAB_CLI_ACCOUNT`, else the one
+/// chosen with `colab auth use`, else `default`.
+pub fn account() -> String {
+    if let Some(name) = SELECTED.get() {
+        return name.clone();
+    }
+    std::env::var("COLAB_CLI_ACCOUNT")
+        .ok()
+        .or_else(|| std::fs::read_to_string(root().join("account")).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| check_account(name).is_ok())
+        .unwrap_or_else(|| DEFAULT_ACCOUNT.to_owned())
+}
+
+/// Where an account keeps its sign-in, slots, settings and idle watcher.
+pub fn account_home(name: &str) -> PathBuf {
+    if name == DEFAULT_ACCOUNT {
+        root()
+    } else {
+        root().join("accounts").join(name)
+    }
+}
+
+/// Every account with a directory (`default` always).
+pub fn accounts() -> Vec<String> {
+    let mut names = vec![DEFAULT_ACCOUNT.to_owned()];
+    if let Ok(entries) = std::fs::read_dir(root().join("accounts")) {
+        let mut more: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| check_account(name).is_ok() && name != DEFAULT_ACCOUNT)
+            .collect();
+        more.sort();
+        names.extend(more);
+    }
+    names
 }
 
 /// Create a directory readable only by the current user.
@@ -74,5 +140,23 @@ pub fn trace(phase: &str, started: std::time::Instant) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var("COLAB_CLI_TRACE").is_ok_and(|v| v == "1")) {
         eprintln!("[trace] {phase}: {} ms", started.elapsed().as_millis());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_names_and_homes() {
+        for good in ["default", "work", "team-2", "a_b"] {
+            assert!(check_account(good).is_ok(), "{good}");
+        }
+        for bad in ["", "Work", "../x", "a/b", "a b", &"x".repeat(33)] {
+            assert!(check_account(bad).is_err(), "{bad}");
+        }
+        // The default account keeps the pre-accounts layout.
+        assert_eq!(account_home(DEFAULT_ACCOUNT), root());
+        assert_eq!(account_home("work"), root().join("accounts").join("work"));
     }
 }

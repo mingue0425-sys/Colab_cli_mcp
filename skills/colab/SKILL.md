@@ -53,6 +53,9 @@ Files under `/content` disappear when the runtime stops.
 - Need it in Google Drive: `colab_save_to_drive` with `path` and `folder` (for example `folder: "colab-cli-results"`). It copies straight from the runtime, creates missing folders, and needs **no Drive mount and no approval**. Use it for several files one call at a time, or write them into one archive first.
 - Mount Drive in code (`drive.mount("/content/drive")`) only when the code itself must read or write Drive files during the run, such as a dataset already in Drive. Each new runtime may need a browser approval for that. If a result contains `authorization_url`, give the link to the user, then run again after they approve. Do not stop the rest of the task while waiting; use `colab_save_to_drive` for outputs instead.
 - Find saved files later with `drive_search` and fetch them with `drive_download`.
+- `drive_account` on `colab_save_to_drive` saves into another signed-in colab-cli account's Drive. Use it only when the user asks for that account.
+
+The server works in one account profile; its instructions name it. Do not switch accounts to get around quota or hardware limits. Colab forbids using multiple accounts that way.
 
 `notebook_run` runs a Drive notebook's code cells in order; `save: true` writes the outputs back into the notebook. It stops at the first cell that is not `ok` unless `continue_on_error` is set.
 

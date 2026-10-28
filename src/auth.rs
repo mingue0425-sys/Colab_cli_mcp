@@ -163,6 +163,11 @@ impl Auth {
         }
     }
 
+    /// The signed-in email, read locally (no network).
+    pub fn email(&self) -> Option<String> {
+        self.load().ok().map(|grant| grant.email)
+    }
+
     pub fn logout(&self) -> Result<Value> {
         let path = self.token_path();
         let existed = path.exists();
@@ -231,7 +236,9 @@ impl Auth {
                 &serde_json::to_vec(&json!({"client_id": id, "client_secret": secret}))?,
             )?;
         }
+        // Another account can sign in with the default account's client.
         let client: Value = std::fs::read(&client_path)
+            .or_else(|_| std::fs::read(config::root().join("client.json")))
             .ok()
             .and_then(|raw| serde_json::from_slice(&raw).ok())
             .ok_or_else(|| {

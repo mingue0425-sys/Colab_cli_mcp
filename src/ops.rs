@@ -41,8 +41,20 @@ macro_rules! on_runtime {
     }};
 }
 
+/// Where `save_to_drive` puts a file: a folder path or folder ID, a name,
+/// and optionally another signed-in account's Drive.
+#[derive(Default)]
+pub struct DriveTarget<'a> {
+    pub folder: Option<&'a str>,
+    pub parent: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub account: Option<&'a str>,
+}
+
 pub struct App {
     pub api: Api,
+    /// The account in use and its state directory.
+    pub account: String,
     pub home: std::path::PathBuf,
     kernels: tokio::sync::Mutex<HashMap<String, Arc<Kernel>>>,
     /// The MCP server keeps kernel channels open between calls; the CLI closes them.
@@ -92,10 +104,12 @@ fn kernel_busy() -> Error {
 
 impl App {
     pub fn new(keep_open: bool) -> Result<Self> {
-        let home = config::home();
+        let account = config::account();
+        let home = config::account_home(&account);
         config::private_dir(&home)?;
         Ok(Self {
             api: Api::new(home.clone()),
+            account,
             home,
             kernels: tokio::sync::Mutex::new(HashMap::new()),
             keep_open,
@@ -193,7 +207,7 @@ impl App {
                     let busy = result["status"] == "timeout";
                     runtime::remember_kernel(&self.home, slot, &lease.endpoint, &kernel_id, busy)?;
                     runtime::touch(&self.home, &lease.endpoint)?;
-                    crate::reaper::ensure_running(&self.home);
+                    crate::reaper::ensure_running(&self.home, &self.account);
                     self.release(&kernel).await;
                     return Ok((result, lease, allocated));
                 }
@@ -392,17 +406,22 @@ impl App {
     pub async fn save_to_drive(
         &self,
         remote: &str,
-        folder: Option<&str>,
-        parent: Option<&str>,
-        name: Option<&str>,
+        to: &DriveTarget<'_>,
         slot: Option<&str>,
         endpoint: Option<&str>,
     ) -> Result<Value> {
         let parts = kernel::remote_parts(remote)?;
-        let name = name
+        let name = to
+            .name
             .map(str::to_owned)
             .unwrap_or_else(|| parts.last().cloned().unwrap_or_default());
-        let parent = drive::destination(&self.api, parent, folder).await?;
+        // The runtime belongs to this account; the Drive may be another's.
+        let other = match to.account.filter(|a| *a != self.account) {
+            Some(account) => Some(crate::accounts::api(account)?),
+            None => None,
+        };
+        let drive_api = other.as_ref().unwrap_or(&self.api);
+        let parent = drive::destination(drive_api, to.parent, to.folder).await?;
         on_runtime!(self, slot, endpoint, |kernel, _lease| {
             let response = kernel.open_file(remote).await?;
             let size = response.content_length().ok_or_else(|| {
@@ -434,7 +453,7 @@ impl App {
                 .map(str::to_owned);
             let body = reqwest::Body::wrap_stream(response.bytes_stream());
             let mut uploaded = drive::upload_body(
-                &self.api,
+                drive_api,
                 &name,
                 parent.as_deref(),
                 mime.as_deref(),
@@ -443,6 +462,10 @@ impl App {
             )
             .await?;
             uploaded["source"] = remote.into();
+            if let Some(account) = to.account.filter(|_| other.is_some()) {
+                uploaded["drive_account"] = account.into();
+                uploaded["drive_email"] = drive_api.auth.email().into();
+            }
             Ok(uploaded)
         })
     }

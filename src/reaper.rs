@@ -16,8 +16,8 @@ fn lock_file(home: &Path) -> std::io::Result<std::fs::File> {
         .open(home.join("reaper.lock"))
 }
 
-/// Start the reaper unless one is already running or auto-stop is disabled.
-pub fn ensure_running(home: &Path) {
+/// Start the account's reaper unless one is already running or auto-stop is disabled.
+pub fn ensure_running(home: &Path, account: &str) {
     if runtime::idle_stop_minutes(home) == 0 {
         return;
     }
@@ -30,8 +30,8 @@ pub fn ensure_running(home: &Path) {
         return;
     };
     let _ = std::process::Command::new(exe)
-        .arg("reaper")
-        .env("COLAB_CLI_HOME", home)
+        .args(["--account", account, "reaper"])
+        .env("COLAB_CLI_HOME", config::root())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
