@@ -236,12 +236,20 @@ impl Auth {
                 &serde_json::to_vec(&json!({"client_id": id, "client_secret": secret}))?,
             )?;
         }
-        // Another account can sign in with the default account's client.
-        let client: Value = std::fs::read(&client_path)
-            .or_else(|_| std::fs::read(config::root().join("client.json")))
-            .ok()
-            .and_then(|raw| serde_json::from_slice(&raw).ok())
-            .ok_or_else(|| {
+        // Otherwise reuse a client already in use: the default account's, or
+        // the one inside a saved (possibly imported) grant.
+        let root = config::root();
+        let client: Value = [
+            client_path,
+            root.join("client.json"),
+            self.token_path(),
+            root.join("token.json"),
+        ]
+        .iter()
+        .filter_map(|path| std::fs::read(path).ok())
+        .filter_map(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .find(|c| c["client_id"].is_string() && c["client_secret"].is_string())
+        .ok_or_else(|| {
                 Error::new(
                     "client_required",
                     "No Google OAuth client is configured.",
@@ -268,7 +276,7 @@ impl Auth {
             .append_pair("response_type", "code")
             .append_pair("scope", &SCOPES.join(" "))
             .append_pair("access_type", "offline")
-            .append_pair("prompt", "consent")
+            .append_pair("prompt", "select_account consent")
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", &state);
