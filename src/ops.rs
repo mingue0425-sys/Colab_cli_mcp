@@ -41,6 +41,23 @@ macro_rules! on_runtime {
     }};
 }
 
+/// How a background job starts and what happens once it ends.
+#[derive(Default)]
+pub struct JobOptions<'a> {
+    /// Run the code as a bash script.
+    pub shell: bool,
+    /// Prefix for the job ID.
+    pub name: Option<&'a str>,
+    /// Start only after this job ends, whatever its outcome.
+    pub after: Option<&'a str>,
+    /// Runtime files or folders to copy into Drive once the job ends.
+    pub outputs: Vec<String>,
+    /// Drive folder path for `outputs`.
+    pub save_folder: Option<&'a str>,
+    /// Save `outputs` into another signed-in account's Drive.
+    pub drive_account: Option<&'a str>,
+}
+
 /// Where `save_to_drive` puts a file: a folder path or folder ID, a name,
 /// and optionally another signed-in account's Drive.
 #[derive(Default)]
@@ -437,10 +454,19 @@ impl App {
                     let mut running = false;
                     for entry in listing["entries"].as_array().into_iter().flatten() {
                         let id = entry["name"].as_str().unwrap_or_default();
-                        if matches!(kernel.tail(&format!("{}/exit_code", jobs::dir(id)), 16).await, Err(ref e) if e.code == "not_found")
+                        match kernel
+                            .tail(&format!("{}/exit_code", jobs::dir(id)), 16)
+                            .await
                         {
-                            running = true;
-                            break;
+                            Err(ref e) if e.code == "not_found" => {
+                                running = true;
+                                break;
+                            }
+                            // Ended: save its declared outputs before the runtime goes.
+                            Ok(_) => {
+                                self.autosave(&kernel, id, endpoint).await;
+                            }
+                            Err(_) => {}
                         }
                     }
                     running
@@ -594,28 +620,99 @@ impl App {
     }
 
     /// Wait until a job finishes (or the wait ends) and return its status.
+    /// With several jobs, returns once all have ended (or, with `any`, the
+    /// first one), as {jobs, ended, unfinished}.
     pub async fn job_wait(
         &self,
-        id: &str,
+        ids: &[String],
+        any: bool,
         seconds: u64,
         lines: usize,
         slot: Option<&str>,
         endpoint: Option<&str>,
     ) -> Result<Value> {
+        if ids.is_empty() {
+            return Err(Error::input("Name at least one job to wait for."));
+        }
         let deadline = std::time::Instant::now() + timeout(seconds)?;
+        let unfinished =
+            |status: &Value| matches!(status["state"].as_str(), Some("running" | "waiting"));
         loop {
-            let status = self.job_status(id, lines, slot, endpoint).await?;
-            if status["state"] != "running" {
-                return Ok(status);
+            let mut statuses = Vec::new();
+            for id in ids {
+                statuses.push(self.job_status(id, lines, slot, endpoint).await?);
             }
-            if std::time::Instant::now() + Duration::from_secs(5) > deadline {
-                let mut status = status;
-                status["note"] =
-                    "Still running after the wait; call job wait or job status again.".into();
-                return Ok(status);
+            let pending = statuses.iter().filter(|s| unfinished(s)).count();
+            let done = if any {
+                pending < statuses.len()
+            } else {
+                pending == 0
+            };
+            let out_of_time = std::time::Instant::now() + Duration::from_secs(5) > deadline;
+            if done || out_of_time {
+                let note = (!done)
+                    .then_some("Still running after the wait; call job wait or job status again.");
+                if let [single] = statuses.as_slice() {
+                    let mut status = single.clone();
+                    if let Some(note) = note {
+                        status["note"] = note.into();
+                    }
+                    return Ok(status);
+                }
+                let state = |s: &Value| s["job"].as_str().unwrap_or_default().to_owned();
+                let mut out = json!({
+                    "ended": statuses.iter().filter(|s| !unfinished(s)).map(state).collect::<Vec<_>>(),
+                    "unfinished": statuses.iter().filter(|s| unfinished(s)).map(state).collect::<Vec<_>>(),
+                    "jobs": statuses,
+                });
+                if let Some(note) = note {
+                    out["note"] = note.into();
+                }
+                return Ok(out);
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
+    }
+
+    /// Copy a finished job's declared outputs into Drive, once. A marker
+    /// written first keeps a second caller from saving them again.
+    async fn autosave(&self, kernel: &Kernel, id: &str, endpoint: &str) -> Option<Value> {
+        let dir = jobs::dir(id);
+        let read = |name: &str| {
+            let path = format!("{dir}/{name}");
+            async move {
+                let (bytes, _) = kernel.tail(&path, 64 * 1024).await.ok()?;
+                serde_json::from_slice::<Value>(&bytes).ok()
+            }
+        };
+        let spec = read("autosave.json").await?;
+        if let Some(result) = read("autosave_result.json").await {
+            return Some(result);
+        }
+        let result_path = format!("{dir}/autosave_result.json");
+        let marker = json!({"state": "saving"});
+        kernel
+            .write_text(&result_path, &marker.to_string())
+            .await
+            .ok()?;
+        let to = DriveTarget {
+            folder: spec["folder"].as_str(),
+            account: spec["drive_account"].as_str(),
+            ..DriveTarget::default()
+        };
+        let mut saved = Vec::new();
+        for output in spec["outputs"].as_array().into_iter().flatten() {
+            let path = output.as_str().unwrap_or_default();
+            saved.push(
+                match Box::pin(self.save_to_drive(path, &to, None, Some(endpoint))).await {
+                    Ok(done) => done,
+                    Err(error) => json!({"source": path, "error": error.to_json()["error"]}),
+                },
+            );
+        }
+        let result = json!({"state": "done", "folder": spec["folder"], "drive_account": spec["drive_account"], "saved": saved});
+        let _ = kernel.write_text(&result_path, &result.to_string()).await;
+        Some(result)
     }
 
     /// CLI downloads land in the working directory unless COLAB_CLI_DOWNLOADS is set.
@@ -630,22 +727,45 @@ impl App {
     pub async fn job_start(
         &self,
         source: &str,
-        shell: bool,
-        name: Option<&str>,
+        options: &JobOptions<'_>,
         slot: &str,
         hardware: Option<Hardware>,
     ) -> Result<Value> {
         if source.trim().is_empty() {
             return Err(Error::input("No job code or command."));
         }
-        let id = jobs::new_id(name)?;
-        let snippet = jobs::start_snippet(&id, source, shell)?;
+        if let Some(after) = options.after {
+            jobs::check_id(after)?;
+        }
+        let autosave = match (options.outputs.is_empty(), options.save_folder) {
+            (true, None) => None,
+            (false, Some(folder)) => {
+                for output in &options.outputs {
+                    kernel::remote_parts(output)?;
+                }
+                if let Some(account) = options.drive_account {
+                    crate::accounts::api(account)?; // Fail now, not when the job ends.
+                }
+                Some(
+                    json!({"outputs": options.outputs, "folder": folder, "drive_account": options.drive_account}),
+                )
+            }
+            _ => {
+                return Err(Error::input(
+                    "Saving job outputs needs both the runtime paths (--outputs) and a Drive folder (--save-to-drive).",
+                ));
+            }
+        };
+        let id = jobs::new_id(options.name)?;
+        let snippet =
+            jobs::start_snippet(&id, source, options.shell, options.after, autosave.as_ref())?;
         let (result, lease, allocated) = self
             .execute(slot, hardware, &snippet, Duration::from_secs(60), false)
             .await?;
         let started = jobs::parse_line(&result)?;
         let mut out = json!({
-            "job": id, "pid": started["pid"], "state": "running",
+            "job": id, "pid": started["pid"],
+            "state": if options.after.is_some() { "waiting" } else { "running" },
             "log": format!("{}/log", jobs::dir(&id).trim_start_matches('/')),
             "runtime": runtime_info(slot, &lease, allocated),
             "next_step": format!("Check progress with `colab job status {id}`; stop it with `colab job stop {id}`."),
@@ -669,7 +789,7 @@ impl App {
     ) -> Result<Value> {
         jobs::check_id(id)?;
         let dir = jobs::dir(id);
-        on_runtime!(self, slot, endpoint, |kernel, _lease| {
+        on_runtime!(self, slot, endpoint, |kernel, lease| {
             let exit_code = match kernel.tail(&format!("{dir}/exit_code"), 64).await {
                 Ok((bytes, _)) => String::from_utf8_lossy(&bytes).trim().parse::<i64>().ok(),
                 Err(error) if error.code == "not_found" => None,
@@ -699,6 +819,11 @@ impl App {
             status["job"] = id.into();
             status["log_bytes"] = total.into();
             status["log_tail"] = jobs::last_lines(&log, lines, cut).into();
+            if exit_code.is_some()
+                && let Some(saved) = self.autosave(&kernel, id, &lease.endpoint).await
+            {
+                status["autosave"] = saved;
+            }
             if stats.is_some() {
                 status["memory_log"] =
                     format!("{}/memory.jsonl", dir.trim_start_matches('/')).into();

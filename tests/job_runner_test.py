@@ -12,12 +12,12 @@ RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "
 LINUX = os.path.isdir("/proc/self")
 
 
-def run_job(source, kind="python"):
+def run_job(source, kind="python", after=None):
     job = tempfile.mkdtemp()
     with open(os.path.join(job, "main.py" if kind == "python" else "main.sh"), "w") as f:
         f.write(source)
     env = dict(os.environ, COLAB_CLI_JOB_EVERY="0.2")
-    subprocess.run([sys.executable, RUNNER, job, kind], env=env, check=True, timeout=60)
+    subprocess.run([sys.executable, RUNNER, job, kind] + ([after] if after else []), env=env, check=True, timeout=60)
     read = lambda name: open(os.path.join(job, name)).read()
     return read("exit_code"), json.loads(read("stats.json")), read("log"), read("memory.jsonl")
 
@@ -49,6 +49,29 @@ class Supervisor(unittest.TestCase):
         code, stats, log, _ = run_job(f"echo start\n{sys.executable} -c 'import os; os.kill(os.getpid(), 9)'\n", "shell")
         self.assertEqual((code, stats["exit_code"]), ("137", 137))
         self.assertTrue(log.startswith("start\n") and "Killed" in log, log)
+
+
+    def test_after_waits_for_the_other_job(self):
+        first = tempfile.mkdtemp()
+        with open(os.path.join(first, "main.py"), "w") as f:
+            f.write("import time\ntime.sleep(1)\nraise SystemExit(5)\n")
+        env = dict(os.environ, COLAB_CLI_JOB_EVERY="0.2")
+        runner = subprocess.Popen([sys.executable, RUNNER, first, "python"], env=env)
+        with open(os.path.join(first, "pid"), "w") as f:
+            f.write(str(runner.pid))
+        source = f"import os\nprint(open(os.path.join({first!r}, 'exit_code')).read())\n"
+        code, stats, log, _ = run_job(source, after=first)
+        runner.wait()
+        # It ran only after the first job ended, although that one failed.
+        self.assertEqual((code, log), ("0", "5\n"))
+        self.assertNotIn("waiting_for", stats)
+
+    def test_after_a_vanished_job_starts_anyway(self):
+        gone = tempfile.mkdtemp()
+        with open(os.path.join(gone, "pid"), "w") as f:
+            f.write("999999")
+        code, _, log, _ = run_job("print('ran')", after=gone)
+        self.assertEqual((code, log), ("0", "ran\n"))
 
 
 if __name__ == "__main__":

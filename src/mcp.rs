@@ -134,6 +134,10 @@ pub fn tools() -> Vec<Tool> {
                         "code": {"type": "string", "description": "Python script, or bash when shell is true. Print progress; output goes to the job log."},
                         "shell": {"type": "boolean", "description": "Run code as a bash script."},
                         "name": {"type": "string", "description": "Short name used as the job ID prefix, e.g. train."},
+                        "after": {"type": "string", "description": "Job ID to wait for: this job starts once that one ends, whatever its outcome. Chain jobs to run steps one at a time."},
+                        "outputs": {"type": "array", "items": {"type": "string"}, "description": "Runtime files or folders to copy into Drive when the job ends (also after a failure); needs save_to_drive."},
+                        "save_to_drive": {"type": "string", "description": "Drive folder path for outputs, created if missing."},
+                        "drive_account": {"type": "string", "description": "Save outputs into another signed-in colab-cli account's Drive; only when the user asks."},
                     }),
                 ),
                 &["code"],
@@ -157,17 +161,19 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "colab_job_wait",
-            "Wait until a background job finishes (up to timeout seconds) and return its status and log tail, instead of polling.",
+            "Wait until a background job (or several) finishes, up to timeout seconds, and return the status and log tail instead of polling. A job with outputs and save_to_drive has them saved to Drive when it ends (see autosave).",
             schema(
                 merge(
                     target(),
                     json!({
                         "job": {"type": "string"},
+                        "jobs": {"type": "array", "items": {"type": "string"}, "description": "Several job IDs; returns when all have ended (or any, with any=true)."},
+                        "any": {"type": "boolean", "description": "Return as soon as one of the jobs ends."},
                         "timeout": {"type": "integer", "description": "Seconds to wait (1-3600, default 300)."},
                         "lines": {"type": "integer", "description": "Log lines to return (default 40)."},
                     }),
                 ),
-                &["job"],
+                &[],
             ),
             true,
         ),
@@ -381,6 +387,15 @@ impl Args {
         self.str(name)
             .ok_or_else(|| Error::input(format!("{name} is required.")))
     }
+    fn strings(&self, name: &str) -> Vec<String> {
+        self.0
+            .get(name)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    }
     fn bool(&self, name: &str) -> bool {
         self.0.get(name).and_then(Value::as_bool).unwrap_or(false)
     }
@@ -438,10 +453,17 @@ impl Server {
                     .await
             }
             "colab_job_start" => {
+                let options = crate::ops::JobOptions {
+                    shell: args.bool("shell"),
+                    name: args.str("name"),
+                    after: args.str("after"),
+                    outputs: args.strings("outputs"),
+                    save_folder: args.str("save_to_drive"),
+                    drive_account: args.str("drive_account"),
+                };
                 app.job_start(
                     args.required("code")?,
-                    args.bool("shell"),
-                    args.str("name"),
+                    &options,
                     args.slot(),
                     args.hardware()?,
                 )
@@ -558,8 +580,11 @@ impl Server {
                 .await
             }
             "colab_job_wait" => {
+                let mut jobs = args.strings("jobs");
+                jobs.extend(args.str("job").map(str::to_owned));
                 app.job_wait(
-                    args.required("job")?,
+                    &jobs,
+                    args.bool("any"),
                     args.int("timeout", 300),
                     args.int("lines", 40) as usize,
                     args.str("slot"),

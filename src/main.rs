@@ -200,10 +200,22 @@ enum JobCommand {
         /// Short name used as the job ID prefix.
         #[arg(long)]
         name: Option<String>,
+        /// Start only after this job ends (whatever its outcome), e.g. to run steps one by one.
+        #[arg(long, value_name = "JOB")]
+        after: Option<String>,
+        /// Runtime file or folder to copy into Drive when the job ends (repeatable).
+        #[arg(long = "outputs", value_name = "PATH")]
+        outputs: Vec<String>,
+        /// Drive folder path for --outputs, created if missing.
+        #[arg(long, value_name = "FOLDER")]
+        save_to_drive: Option<String>,
+        /// Save --outputs into another signed-in account's Drive.
+        #[arg(long, value_name = "NAME")]
+        drive_account: Option<String>,
         #[command(flatten)]
         machine: Machine,
     },
-    /// State (running, succeeded, failed, stopped) and the end of the log.
+    /// State (running, waiting, succeeded, failed, stopped, killed, lost) and the end of the log.
     Status {
         job: String,
         /// Log lines to return.
@@ -225,7 +237,12 @@ enum JobCommand {
     },
     /// Wait until a job finishes (or --timeout seconds pass), then print its status.
     Wait {
-        job: String,
+        /// One or more job IDs; waits for all of them unless --any.
+        #[arg(required = true)]
+        jobs: Vec<String>,
+        /// Return as soon as any one of the jobs ends.
+        #[arg(long)]
+        any: bool,
         #[arg(long, default_value_t = 600)]
         timeout: u64,
         #[arg(long, default_value_t = 40)]
@@ -393,13 +410,15 @@ async fn dispatch(command: Command) -> Result<Value> {
             .await?
         }
         Command::Job(JobCommand::Wait {
-            job,
+            jobs,
+            any,
             timeout,
             lines,
             target,
         }) => {
             app.job_wait(
-                &job,
+                &jobs,
+                any,
                 timeout,
                 lines,
                 target.slot.as_deref(),
@@ -465,17 +484,23 @@ async fn dispatch(command: Command) -> Result<Value> {
             file,
             shell,
             name,
+            after,
+            outputs,
+            save_to_drive,
+            drive_account,
             machine,
         }) => {
             let code = source(code, file)?;
-            app.job_start(
-                &code,
+            let options = ops::JobOptions {
                 shell,
-                name.as_deref(),
-                &machine.slot,
-                machine.hardware()?,
-            )
-            .await?
+                name: name.as_deref(),
+                after: after.as_deref(),
+                outputs,
+                save_folder: save_to_drive.as_deref(),
+                drive_account: drive_account.as_deref(),
+            };
+            app.job_start(&code, &options, &machine.slot, machine.hardware()?)
+                .await?
         }
         Command::Job(JobCommand::Status { job, lines, target }) => {
             app.job_status(

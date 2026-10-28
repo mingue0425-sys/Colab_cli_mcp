@@ -601,6 +601,19 @@ impl Kernel {
         Ok(json!({"path": listing["path"], "entries": entries}))
     }
 
+    /// Write a small text file on the runtime (job bookkeeping).
+    pub async fn write_text(&self, path: &str, text: &str) -> Result<()> {
+        let url = self.file_url("api/contents/", &remote_parts(path)?)?;
+        self.json(
+            reqwest::Method::PUT,
+            url,
+            Some(json!({"type": "file", "format": "text", "content": text})),
+            "Runtime write",
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Whether a runtime path is a directory (without fetching any content).
     pub async fn is_dir(&self, path: &str) -> Result<bool> {
         let mut url = self.file_url("api/contents/", &remote_parts(path)?)?;

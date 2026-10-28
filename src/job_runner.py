@@ -18,6 +18,7 @@ import time
 
 EVERY = float(os.environ.get("COLAB_CLI_JOB_EVERY", 5))  # seconds between samples
 RECENT = 60  # seconds of samples kept for "memory just before the end"
+LOST_AFTER = 120  # seconds without a heartbeat after which a job counts as gone
 
 
 def set_oom_score(value):
@@ -88,12 +89,37 @@ def write_json(path, value):
     os.replace(tmp, path)
 
 
-def main(job_dir, kind):
+def ended(job_dir):
+    """Whether another job has finished: it recorded an exit code, or its
+    supervisor is gone or silent without recording one."""
+    if os.path.exists(os.path.join(job_dir, "exit_code")):
+        return True
+    try:
+        with open(os.path.join(job_dir, "stats.json")) as f:
+            if time.time() - json.load(f)["updated_at"] > LOST_AFTER:
+                return True
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        with open(os.path.join(job_dir, "pid")) as f:
+            os.kill(int(f.read()), 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def main(job_dir, kind, after=None):
     me = os.getpid()
     set_oom_score(-1000)
     script = os.path.join(job_dir, "main.py" if kind == "python" else "main.sh")
     argv = [sys.executable, "-u", script] if kind == "python" else ["bash", script]
     stats_path = os.path.join(job_dir, "stats.json")
+    # Queued behind another job: wait for it to end, whatever its outcome.
+    while after and not ended(after):
+        write_json(stats_path, {"waiting_for": os.path.basename(after), "updated_at": time.time()})
+        time.sleep(EVERY)
     stats = {"started_at": time.time(), "peak_rss": 0, "min_available": None}
     recent = []
     with open(os.path.join(job_dir, "log"), "ab", buffering=0) as log, open(
@@ -144,4 +170,4 @@ def main(job_dir, kind):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    main(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)

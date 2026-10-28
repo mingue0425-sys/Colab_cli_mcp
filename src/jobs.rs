@@ -43,19 +43,33 @@ const RUNNER: &str = include_str!("job_runner.py");
 /// Python run by the kernel to launch the job detached from it, under the
 /// supervisor. Values are embedded as JSON string literals, which are valid
 /// Python literals.
-pub fn start_snippet(id: &str, source: &str, shell: bool) -> Result<String> {
+/// `after` queues the job behind another one; `autosave` (outputs, Drive
+/// folder, account) is kept in the job directory for when it ends.
+pub fn start_snippet(
+    id: &str,
+    source: &str,
+    shell: bool,
+    after: Option<&str>,
+    autosave: Option<&Value>,
+) -> Result<String> {
     let (file, kind) = if shell {
         ("main.sh", "shell")
     } else {
         ("main.py", "python")
     };
+    let after = after.map(dir);
     Ok(format!(
         r#"import json as _j, os as _o, subprocess as _s
 _d = {dir}
+_a = {after}
+if _a and not _o.path.isdir(_a):
+    raise FileNotFoundError("No job " + _o.path.basename(_a) + " on this runtime to wait for.")
 _o.makedirs(_d, exist_ok=True)
 open(_o.path.join(_d, {file}), "w").write({source})
 open(_o.path.join(_d, "runner.py"), "w").write({runner})
-_p = _s.Popen(["python", _o.path.join(_d, "runner.py"), _d, {kind}], cwd="/content", start_new_session=True, stdin=_s.DEVNULL, stdout=_s.DEVNULL, stderr=_s.DEVNULL)
+if {autosave} is not None:
+    open(_o.path.join(_d, "autosave.json"), "w").write({autosave})
+_p = _s.Popen(["python", _o.path.join(_d, "runner.py"), _d, {kind}] + ([_a] if _a else []), cwd="/content", start_new_session=True, stdin=_s.DEVNULL, stdout=_s.DEVNULL, stderr=_s.DEVNULL)
 open(_o.path.join(_d, "pid"), "w").write(str(_p.pid))
 print(_j.dumps({{"job": {id}, "pid": _p.pid}}))"#,
         dir = serde_json::to_string(&dir(id))?,
@@ -64,6 +78,14 @@ print(_j.dumps({{"job": {id}, "pid": _p.pid}}))"#,
         runner = serde_json::to_string(RUNNER)?,
         kind = serde_json::to_string(kind)?,
         id = serde_json::to_string(id)?,
+        after = match &after {
+            Some(after) => serde_json::to_string(after)?,
+            None => "None".to_owned(),
+        },
+        autosave = match autosave {
+            Some(spec) => serde_json::to_string(&spec.to_string())?,
+            None => "None".to_owned(),
+        },
     ))
 }
 
@@ -169,8 +191,10 @@ pub fn describe(exit_code: Option<i64>, stats: Option<&Value>, now: f64) -> Valu
     let silent = stats
         .and_then(|s| s["updated_at"].as_f64())
         .is_some_and(|t| now - t > LOST_AFTER);
+    let waiting = stats.is_some_and(|s| s.get("waiting_for").is_some());
     out["state"] = json!(match exit_code {
         None if silent => "lost",
+        None if waiting => "waiting",
         None => "running",
         Some(0) => "succeeded",
         Some(-15) => "stopped",
@@ -178,6 +202,10 @@ pub fn describe(exit_code: Option<i64>, stats: Option<&Value>, now: f64) -> Valu
         Some(_) => "failed",
     });
     let Some(stats) = stats else { return out };
+    if waiting {
+        out["waiting_for"] = stats["waiting_for"].clone();
+        return out;
+    }
     let mut memory = json!({
         "total_mb": mb(stats, "total"),
         "peak_job_mb": mb(stats, "peak_rss"),
@@ -221,12 +249,19 @@ mod tests {
 
     #[test]
     fn snippets_embed_values_as_literals() {
-        let snippet = start_snippet("job-1", "print(\"a\\\"b\")\n'''", false).unwrap();
+        let snippet = start_snippet("job-1", "print(\"a\\\"b\")\n'''", false, None, None).unwrap();
         assert!(snippet.contains(r#"_d = "/content/.colab-cli/jobs/job-1""#));
         assert!(snippet.contains(r#""print(\"a\\\"b\")\n'''""#));
         assert!(snippet.contains(r#"_d, "python"]"#));
         assert!(snippet.contains("def group_rss"));
-        let shell = start_snippet("x", "ls", true).unwrap();
+        let shell = start_snippet(
+            "x",
+            "ls",
+            true,
+            Some("first"),
+            Some(&json!({"outputs": ["content/out"]})),
+        )
+        .unwrap();
         assert!(shell.contains(r#""main.sh""#) && shell.contains(r#"_d, "shell"]"#));
         assert!(check_id("../x").is_err());
         assert!(new_id(Some("train")).unwrap().starts_with("train-"));
@@ -246,7 +281,14 @@ mod tests {
         else {
             return; // No Python here; CI has it.
         };
-        let snippet = start_snippet("j", "print('''x''')\n", false).unwrap();
+        let snippet = start_snippet(
+            "j",
+            "print('''x''')\n",
+            false,
+            Some("a"),
+            Some(&json!({"folder": "r"})),
+        )
+        .unwrap();
         python
             .stdin
             .take()
@@ -262,6 +304,13 @@ mod tests {
         let now = 1000.0;
         assert_eq!(describe(None, None, now)["state"], "running");
         assert_eq!(describe(Some(-15), None, now)["state"], "stopped");
+        let queued = json!({"waiting_for": "first-1", "updated_at": 995.0});
+        let waiting = describe(None, Some(&queued), now);
+        assert_eq!(
+            (waiting["state"].as_str(), waiting["waiting_for"].as_str()),
+            (Some("waiting"), Some("first-1"))
+        );
+        assert_eq!(describe(None, Some(&queued), now + 300.0)["state"], "lost");
         let running = json!({"updated_at": 990.0, "total": 12.0 * GB, "available": 4.0 * GB,
                              "rss": 6.0 * GB, "peak_rss": 7.0 * GB, "min_available": 3.0 * GB,
                              "recent_min_available": 3.0 * GB});
