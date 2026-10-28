@@ -39,7 +39,9 @@ Use the `colab` MCP tools when they are connected (`colab_run`, `colab_stop`, `c
 `timeout` defaults to 60 s (max 3600). Anything longer than a minute or two, such as training, large installs or downloads, belongs in a background job:
 
 - `colab_job_start` with `code` (Python) or `shell: true` (bash), optional `name` and the same hardware/slot inputs as `colab_run`. It returns a `job` ID at once.
-- Then call `colab_job_wait` (`job`, `timeout` up to 3600 s). It returns once the job ends, with `state` (`running`, `succeeded`, `failed`, `stopped`, `killed`, `lost`), `exit_code`, `memory` (`peak_job_mb`, `min_available_mb`, `total_mb`) and the end of the log. One wait replaces many status polls. `colab_job_status` gives the same snapshot immediately and works while the kernel is busy. Print progress in the script so the log is useful; progress bars are reduced to their last state.
+- Steps that should run one at a time: start each with `after` set to the previous job's ID. A queued job is `waiting`, and it starts even if the previous one failed. Prefer this over one long script that runs everything.
+- Results to keep: `outputs` (runtime files or folders) with `save_to_drive` (a Drive folder). They are copied when the job ends, also after a failure, and reported under `autosave`.
+- Then call `colab_job_wait` (`job`, or `jobs` with optional `any`; `timeout` up to 3600 s). It returns once the job ends, with `state` (`running`, `succeeded`, `failed`, `stopped`, `killed`, `lost`), `exit_code`, `memory` (`peak_job_mb`, `min_available_mb`, `total_mb`) and the end of the log. One wait replaces many status polls. `colab_job_status` gives the same snapshot immediately and works while the kernel is busy. Print progress in the script so the log is useful; progress bars are reduced to their last state.
 - `colab_job_stop` ends the job and its child processes.
 - Memory: `colab_job_status` shows a running job's memory and the runtime's available memory, so there is no need to log memory yourself or rely on `/usr/bin/time`. When `likely_cause` is `out_of_memory`, follow its `next_step`. Run fewer things at once, split independent work into separate jobs (one failure then leaves the others running and each reports its own peak), or use `high_ram`.
 
@@ -55,7 +57,9 @@ Files under `/content` disappear when the runtime stops.
 - Find saved files later with `drive_search` and fetch them with `drive_download`.
 - `drive_account` on `colab_save_to_drive` saves into another signed-in colab-cli account's Drive. Use it only when the user asks for that account.
 
-The server works in one account profile; its instructions name it. Do not switch accounts to get around quota or hardware limits. Colab forbids using multiple accounts that way.
+Account profiles: every tool takes an optional `account`, `colab_accounts` lists the profiles and `colab_use_account` switches this session's default. Switch only when the user asks. Never switch to get around quota or hardware limits, because Colab forbids using multiple accounts that way. `drive_share` and `drive_copy_to_account` move Drive files between the user's own profiles.
+
+`colab_status` shows each runtime's RAM, disk and GPU use and `gone_recently` (runtimes Colab ended). `colab_download`, `colab_upload` and `colab_save_to_drive` also take folders.
 
 `notebook_run` runs a Drive notebook's code cells in order; `save: true` writes the outputs back into the notebook. It stops at the first cell that is not `ok` unless `continue_on_error` is set.
 

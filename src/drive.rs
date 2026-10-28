@@ -385,6 +385,95 @@ pub async fn copy(api_: &Api, id: &str, name: &str) -> Result<Value> {
     .await
 }
 
+/// Give a Google account access to a file or folder, without a notification email.
+pub async fn share(api_: &Api, id: &str, email: &str, role: &str) -> Result<Value> {
+    check_id(id)?;
+    if !["reader", "commenter", "writer"].contains(&role) {
+        return Err(Error::input("The role is reader, commenter or writer."));
+    }
+    if !email.contains('@') || email.len() > 254 || email.chars().any(char::is_whitespace) {
+        return Err(Error::input(
+            "Share with an email address or a signed-in profile name.",
+        ));
+    }
+    api_.json("Drive share", |http, token| {
+        http.post(api(&format!("drive/v3/files/{id}/permissions")))
+            .bearer_auth(token)
+            .query(&[
+                ("sendNotificationEmail", "false"),
+                ("fields", "id,role,emailAddress"),
+            ])
+            .json(&json!({"type": "user", "role": role, "emailAddress": email}))
+    })
+    .await
+}
+
+/// Remove one permission (used to undo a temporary share).
+pub async fn unshare(api_: &Api, id: &str, permission: &str) -> Result<()> {
+    check_id(id)?;
+    check_id(permission)?;
+    let response = api_
+        .send("Drive unshare", |http, token| {
+            http.delete(api(&format!(
+                "drive/v3/files/{id}/permissions/{permission}"
+            )))
+            .bearer_auth(token)
+        })
+        .await?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(status_error(status, "Drive unshare"));
+    }
+    Ok(())
+}
+
+/// Copy a file into `to`'s own Drive: share it with that account for a moment,
+/// copy it there, then remove the share. Folders cannot be copied by Drive;
+/// share them instead.
+pub async fn copy_between(
+    from: &Api,
+    to: &Api,
+    to_email: &str,
+    id: &str,
+    parent: Option<&str>,
+) -> Result<Value> {
+    let meta = from
+        .json("Drive file", |http, token| {
+            http.get(api(&format!("drive/v3/files/{id}")))
+                .bearer_auth(token)
+                .query(&[("fields", "name,mimeType")])
+        })
+        .await?;
+    if meta["mimeType"] == FOLDER_MIME {
+        return Err(Error::input(
+            "Drive cannot copy folders. Share the folder instead (`colab drive share`), or copy its files one by one.",
+        ));
+    }
+    let granted = share(from, id, to_email, "reader").await?;
+    let mut body = json!({"name": meta["name"]});
+    if let Some(parent) = parent {
+        body["parents"] = json!([parent]);
+    }
+    let copied = to
+        .json("Drive copy", |http, token| {
+            http.post(api(&format!("drive/v3/files/{id}/copy")))
+                .bearer_auth(token)
+                .query(&[("fields", "id,name,webViewLink")])
+                .json(&body)
+        })
+        .await;
+    // Remove the temporary share whether or not the copy worked.
+    let revoked = match granted["id"].as_str() {
+        Some(permission) => unshare(from, id, permission).await.is_ok(),
+        None => false,
+    };
+    let mut copied = copied?;
+    if !revoked {
+        copied["note"] = format!("The temporary read access for {to_email} could not be removed; remove it in Drive's sharing settings if needed.").into();
+    }
+    Ok(copied)
+}
+
 pub async fn rename(api_: &Api, id: &str, name: &str) -> Result<Value> {
     check_id(id)?;
     api_.json("Rename", |http, token| {

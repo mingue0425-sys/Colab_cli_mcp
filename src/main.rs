@@ -277,6 +277,26 @@ enum AuthCommand {
 
 #[derive(Subcommand)]
 enum DriveCommand {
+    /// Share a Drive file or folder with another profile (or an email address).
+    Share {
+        id: String,
+        /// Profile name (see `colab auth list`) or email address.
+        #[arg(long = "with", value_name = "PROFILE|EMAIL")]
+        with: String,
+        /// reader, commenter or writer.
+        #[arg(long, default_value = "reader")]
+        role: String,
+    },
+    /// Copy a Drive file into another profile's own Drive.
+    CopyTo {
+        id: String,
+        /// Destination profile.
+        #[arg(long = "to", value_name = "PROFILE")]
+        to: String,
+        /// Folder path in the destination Drive, created if missing.
+        #[arg(long)]
+        folder: Option<String>,
+    },
     /// Search Drive with a query, e.g. "name contains 'result' and trashed=false".
     Search {
         query: String,
@@ -580,6 +600,15 @@ async fn dispatch(command: Command) -> Result<Value> {
             drive::upload(api, &local, name.as_deref(), parent.as_deref(), None).await?
         }
         Command::Drive(DriveCommand::Mkdir { path }) => drive::ensure_folder(api, &path).await?,
+        Command::Drive(DriveCommand::Share { id, with, role }) => {
+            let (email, profile) = accounts::recipient(&with, true)?;
+            let mut shared = drive::share(api, &id, &email, &role).await?;
+            shared["profile"] = profile.into();
+            shared
+        }
+        Command::Drive(DriveCommand::CopyTo { id, to, folder }) => {
+            accounts::copy_to(api, &id, &to, folder.as_deref()).await?
+        }
         Command::Notebook(NotebookCommand::List { name, limit, page }) => {
             drive::notebooks(api, name.as_deref(), limit, page.as_deref()).await?
         }
@@ -651,5 +680,14 @@ async fn main() {
             print(&error.to_json());
             std::process::exit(error.exit_code());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn command_line_is_consistent() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
     }
 }

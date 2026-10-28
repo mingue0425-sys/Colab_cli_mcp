@@ -74,6 +74,48 @@ pub fn use_account(name: &str) -> Result<Value> {
     Ok(json!({"account": name, "email": email, "in_use": true}))
 }
 
+/// A signed-in profile's email, or the address itself when `who` is one
+/// (`allow_email`); profiles are checked first.
+pub fn recipient(who: &str, allow_email: bool) -> Result<(String, Option<String>)> {
+    if config::check_account(who).is_ok()
+        && let Some(email) = auth(who).email()
+    {
+        return Ok((email, Some(who.to_owned())));
+    }
+    if allow_email && who.contains('@') {
+        return Ok((who.to_owned(), None));
+    }
+    Err(Error::new(
+        "unknown_account",
+        format!(
+            "{who} is not a signed-in profile{}.",
+            if allow_email {
+                " or an email address"
+            } else {
+                ""
+            }
+        ),
+        "List profiles with `colab auth list`.",
+    ))
+}
+
+/// Copy a Drive file from `from` into profile `to`'s Drive.
+pub async fn copy_to(
+    from: &google::Api,
+    id: &str,
+    to: &str,
+    folder: Option<&str>,
+) -> Result<Value> {
+    let (email, _) = recipient(to, false)?;
+    let to_api = api(to)?;
+    let parent = crate::drive::destination(&to_api, None, folder).await?;
+    let mut copied =
+        crate::drive::copy_between(from, &to_api, &email, id, parent.as_deref()).await?;
+    copied["account"] = to.into();
+    copied["email"] = email.into();
+    Ok(copied)
+}
+
 /// The Drive API of another signed-in account, for saving results there.
 pub fn api(name: &str) -> Result<google::Api> {
     config::check_account(name)?;

@@ -236,7 +236,12 @@ fn kernel_busy() -> Error {
 
 impl App {
     pub fn new(keep_open: bool) -> Result<Self> {
-        let account = config::account();
+        Self::for_account(&config::account(), keep_open)
+    }
+
+    pub fn for_account(account: &str, keep_open: bool) -> Result<Self> {
+        config::check_account(account)?;
+        let account = account.to_owned();
         let home = config::account_home(&account);
         config::private_dir(&home)?;
         Ok(Self {
